@@ -1,10 +1,10 @@
-from unittest.mock import MagicMock, Mock
+from contextlib import contextmanager
+from unittest.mock import Mock
 
 import pytest
 
-from zju_ac.auth import fill_login_form, trusted_login_url
+from zju_ac.auth import trusted_login_url
 from zju_ac.cli import main, parser
-from zju_ac.errors import AuthenticationExpired, ZjuError
 
 
 @pytest.mark.parametrize(
@@ -26,13 +26,12 @@ def test_trusted_auth_origins(url):
         "https://identity.zju.edu.cn.evil.example",
         "https://identity.zju.edu.cn@evil.example",
         "about:blank",
+        "https://identity.zju.edu.cn:8443/login",
+        "https://identity.zju.edu.cn:bad/login",
     ],
 )
-def test_credentials_not_filled_on_untrusted_pages(url):
-    page = Mock(url=url)
+def test_untrusted_auth_origins(url):
     assert not trusted_login_url(url)
-    assert not fill_login_form(page, "test", "secret")
-    page.locator.assert_not_called()
 
 
 def test_offline_demo_never_reads_credentials(monkeypatch, capsys):
@@ -48,48 +47,29 @@ def test_too_short_intervals_rejected(option):
         parser().parse_args([option, "1"])
 
 
-def login_mocks(monkeypatch, profiles):
-    from zju_ac import auth
+def test_browser_option_removed():
+    with pytest.raises(SystemExit):
+        parser().parse_args(["--browser", "msedge"])
 
-    engine = Mock()
-    manager = MagicMock()
-    manager.__enter__.return_value = engine
-    browser = engine.chromium.launch.return_value
-    context = browser.new_context.return_value
-    page = context.new_page.return_value
-    page.is_closed.return_value = False
+
+def test_interactive_cli_uses_http_login_then_monitor(monkeypatch):
+    from zju_ac import auth, monitor
+
     client = Mock()
-    client.profile.side_effect = profiles
-    monkeypatch.setattr(auth, "sync_playwright", lambda: manager)
-    monkeypatch.setattr(auth, "CoursesClient", Mock(return_value=client))
-    fill = Mock(return_value=True)
-    monkeypatch.setattr(auth, "fill_login_form", fill)
-    return auth, browser, page, client, fill
+    calls = []
 
+    @contextmanager
+    def fake_login(student_id, password, timeout):
+        calls.append((student_id, password, timeout))
+        yield client
 
-def test_login_waits_for_profile_and_submits_password_only_once(monkeypatch, capsys):
-    auth, browser, page, client, fill = login_mocks(
-        monkeypatch, [AuthenticationExpired("not ready"), {"id": 1}]
-    )
-    with auth.login("test-user", "private-password", "msedge", 180) as result:
-        assert result is client
-        browser.close.assert_not_called()
-    browser.close.assert_called_once()
-    fill.assert_called_once_with(page, "test-user", "private-password")
-    assert "private-password" not in capsys.readouterr().out
-
-
-def test_login_timeout_closes_browser(monkeypatch):
-    auth, browser, _, _, _ = login_mocks(monkeypatch, [AuthenticationExpired("not ready")])
-    monkeypatch.setattr(auth.time, "monotonic", Mock(side_effect=[0, 0, 999]))
-    with pytest.raises(ZjuError, match="登录超时"), auth.login("test", "dummy", "msedge", 5):
-        pytest.fail("An unverified session must not be yielded")
-    browser.close.assert_called_once()
-
-
-def test_closed_login_window_closes_browser(monkeypatch):
-    auth, browser, page, _, _ = login_mocks(monkeypatch, [])
-    page.is_closed.return_value = True
-    with pytest.raises(ZjuError, match="窗口已关闭"), auth.login("test", "dummy", "msedge", 5):
-        pytest.fail("A closed login window must stop authentication")
-    browser.close.assert_called_once()
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "student")
+    monkeypatch.setattr("getpass.getpass", lambda prompt: "dummy-password")
+    monkeypatch.setattr(auth, "login", fake_login)
+    run = Mock()
+    monkeypatch.setattr(monitor, "run_monitor", run)
+    assert main(["--once", "--no-desktop", "--no-bell"]) == 0
+    assert calls == [("student", "dummy-password", 180)]
+    assert run.call_args.args[0] is client
+    assert run.call_args.args[-1] is True
