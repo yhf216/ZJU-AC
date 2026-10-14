@@ -1,3 +1,4 @@
+import builtins
 from contextlib import contextmanager
 from unittest.mock import Mock
 
@@ -73,3 +74,51 @@ def test_interactive_cli_uses_http_login_then_monitor(monkeypatch):
     assert calls == [("student", "dummy-password", 180)]
     assert run.call_args.args[0] is client
     assert run.call_args.args[-1] is True
+
+
+@pytest.mark.parametrize(
+    "module,package",
+    [
+        ("requests", "requests"),
+        ("bs4", "beautifulsoup4"),
+        ("unknown_dependency", None),
+    ],
+)
+def test_missing_dependency_reported_before_credentials(monkeypatch, capsys, module, package):
+    original_import = builtins.__import__
+
+    def missing_import(name, *args, **kwargs):
+        if name == "auth":
+            raise ModuleNotFoundError("private-ticket-must-not-be-printed", name=module)
+        return original_import(name, *args, **kwargs)
+
+    prompt = Mock(side_effect=AssertionError("Credentials must not be requested"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", prompt)
+    monkeypatch.setattr("getpass.getpass", prompt)
+    monkeypatch.setattr("builtins.__import__", missing_import)
+    assert main(["--no-desktop", "--no-bell"]) == 1
+    prompt.assert_not_called()
+    output = capsys.readouterr().err
+    assert "python -m pip install -r requirements.txt" in output
+    if package:
+        assert package in output
+    assert "private-ticket" not in output
+    assert "网络" not in output
+
+
+def test_unexpected_failure_reports_location_without_private_message(monkeypatch, capsys):
+    original_import = builtins.__import__
+
+    def failed_import(name, *args, **kwargs):
+        if name == "auth":
+            raise RuntimeError("private-password-and-ticket")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.__import__", failed_import)
+    assert main(["--no-desktop", "--no-bell"]) == 1
+    output = capsys.readouterr().err
+    assert "RuntimeError" in output
+    assert "test_auth_cli.py:" in output
+    assert "private-password" not in output
