@@ -39,7 +39,6 @@ def run_monitor(
 ) -> None:
     tracker = ReminderTracker(repeat_after)
     failures = 0
-    next_heartbeat = 0.0
     while True:
         started = time.monotonic()
         try:
@@ -56,6 +55,7 @@ def run_monitor(
                 checkin.wait(delay)
             continue
         failures = 0
+        LOGGER.info("监控正常：当前有 %d 项待签到。", len(records))
         for record in records:
             if tracker.due(record, started):
                 notifier.send(record)
@@ -63,9 +63,6 @@ def run_monitor(
         if checkin is not None and not once:
             checkin.observe(records)
             checkin.process()
-        if started >= next_heartbeat:
-            LOGGER.info("监控正常：当前有 %d 项待签到。", len(records))
-            next_heartbeat = started + 300
         if once:
             return
         delay = max(0, interval - (time.monotonic() - started))
