@@ -122,3 +122,24 @@ def test_unexpected_failure_reports_location_without_private_message(monkeypatch
     assert "RuntimeError" in output
     assert "test_auth_cli.py:" in output
     assert "private-password" not in output
+
+
+@pytest.mark.parametrize("options", [["--reminders-only"], ["--once"]])
+def test_read_only_modes_do_not_construct_submission_handler(monkeypatch, options):
+    from zju_ac import auth, checkin, monitor
+
+    @contextmanager
+    def fake_login(*args):
+        yield Mock()
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "student")
+    monkeypatch.setattr("getpass.getpass", lambda prompt: "dummy-password")
+    monkeypatch.setattr(auth, "login", fake_login)
+    handler = Mock(side_effect=AssertionError("Submission handler must not be constructed"))
+    monkeypatch.setattr(checkin, "NumericCheckin", handler)
+    run = Mock()
+    monkeypatch.setattr(monitor, "run_monitor", run)
+    assert main(options) == 0
+    handler.assert_not_called()
+    assert run.call_args.kwargs["checkin"] is None

@@ -61,3 +61,24 @@ def test_transient_failures_back_off_then_recover(monkeypatch):
     assert sleep.call_args_list[0].args == (30,)
     assert sleep.call_args_list[1].args == (60,)
     notifier.send.assert_called_once_with(RECORD)
+
+
+def test_numeric_confirmation_is_processed_without_preventing_next_poll():
+    client, notifier, checkin = Mock(), Mock(), Mock()
+    client.rollcalls.side_effect = [[RECORD], AuthenticationExpired("stop")]
+    with pytest.raises(AuthenticationExpired):
+        run_monitor(client, notifier, checkin=checkin)
+    notifier.send.assert_called_once_with(RECORD)
+    checkin.observe.assert_called_once_with([RECORD])
+    checkin.process.assert_called_once()
+    checkin.wait.assert_called_once()
+    assert client.rollcalls.call_count == 2
+
+
+def test_once_is_read_only_even_if_confirmation_handler_supplied():
+    client, notifier, checkin = Mock(), Mock(), Mock()
+    client.rollcalls.return_value = [RECORD]
+    run_monitor(client, notifier, once=True, checkin=checkin)
+    checkin.observe.assert_not_called()
+    checkin.process.assert_not_called()
+    checkin.wait.assert_not_called()

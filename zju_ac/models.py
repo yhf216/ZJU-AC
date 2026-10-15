@@ -10,6 +10,7 @@ ACTIVE = {"in_progress", "active", "on_going", "started"}
 TERMINAL = {"finished", "expired", "closed"}
 NOT_STARTED = {"not_started", "waiting", "pending", "on_coming"}
 COMPLETED = {"on_call", "on_call_fine", "on_personal_leave"}
+SIGNED = {"on_call", "on_call_fine"}
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,8 @@ class Rollcall:
     title: str
     kind: str
     ends_at: datetime | None = None
+    course_id: str | None = None
+    started_at: datetime | None = None
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -69,5 +72,7 @@ def active_rollcalls(payload: Any, now: datetime | None = None) -> list[Rollcall
             str(item.get("title") or "课堂签到"),
             kind,
             end,
+            str(item["course_id"]) if item.get("course_id") is not None else None,
+            parse_time(item.get("rollcall_time")),
         )
     return list(result.values())

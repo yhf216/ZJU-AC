@@ -8,6 +8,7 @@ from urllib.parse import urljoin, urlsplit
 import requests
 from bs4 import BeautifulSoup, Tag
 
+from . import __version__
 from .client import BASE_URL, CoursesClient
 from .errors import AuthenticationExpired, ProtocolError, TemporaryError, ZjuError
 
@@ -206,7 +207,7 @@ def login(student_id: str, password: str, login_timeout: int = 180):
     session = requests.Session()
     session.headers.update(
         {
-            "User-Agent": "ZJU-AC/0.2.0",
+            "User-Agent": f"ZJU-AC/{__version__}",
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
     )

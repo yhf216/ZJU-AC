@@ -27,6 +27,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--remind-every", type=seconds, default=0, help="未完成时重复提醒的秒数")
     result.add_argument("--login-timeout", type=seconds, default=180, help="登录等待秒数，默认 180")
     result.add_argument("--once", action="store_true", help="登录后查询一次并退出")
+    result.add_argument(
+        "--reminders-only", action="store_true", help="仅提醒，不询问或提交数字签到"
+    )
     result.add_argument("--demo", action="store_true", help="离线演示提醒，无需登录")
     result.add_argument("--no-desktop", action="store_true", help="关闭桌面通知")
     result.add_argument("--no-bell", action="store_true", help="关闭终端提示音")
@@ -47,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # Import runtime dependencies before requesting any credentials.
         from .auth import login
+        from .checkin import NumericCheckin
         from .monitor import run_monitor
 
         student_id = input("学号：").strip()
@@ -55,7 +59,19 @@ def main(argv: list[str] | None = None) -> int:
             raise ZjuError("学号和密码不能为空。")
         with login(student_id, password, args.login_timeout) as client:
             password = ""
-            run_monitor(client, notifier, args.interval, args.remind_every, args.once)
+            checkin = None if args.reminders_only or args.once else NumericCheckin(client)
+            try:
+                run_monitor(
+                    client,
+                    notifier,
+                    args.interval,
+                    args.remind_every,
+                    args.once,
+                    checkin=checkin,
+                )
+            finally:
+                if checkin is not None:
+                    checkin.close()
         return 0
     except (KeyboardInterrupt, EOFError):
         print("\n已退出。")

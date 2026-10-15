@@ -4,6 +4,7 @@ import logging
 import time
 from collections import OrderedDict
 
+from .checkin import NumericCheckin
 from .client import CoursesClient
 from .errors import TemporaryError
 from .models import Rollcall
@@ -34,6 +35,7 @@ def run_monitor(
     interval: float = 15,
     repeat_after: float = 0,
     once: bool = False,
+    checkin: NumericCheckin | None = None,
 ) -> None:
     tracker = ReminderTracker(repeat_after)
     failures = 0
@@ -48,16 +50,26 @@ def run_monitor(
             failures += 1
             delay = min(300, interval * 2 ** min(failures, 5))
             LOGGER.warning("%s %.0f 秒后重试。", exc, delay)
-            time.sleep(delay)
+            if checkin is None:
+                time.sleep(delay)
+            else:
+                checkin.wait(delay)
             continue
         failures = 0
         for record in records:
             if tracker.due(record, started):
                 notifier.send(record)
                 tracker.mark(record, started)
+        if checkin is not None and not once:
+            checkin.observe(records)
+            checkin.process()
         if started >= next_heartbeat:
             LOGGER.info("监控正常：当前有 %d 项待签到。", len(records))
             next_heartbeat = started + 300
         if once:
             return
-        time.sleep(max(0, interval - (time.monotonic() - started)))
+        delay = max(0, interval - (time.monotonic() - started))
+        if checkin is None:
+            time.sleep(delay)
+        else:
+            checkin.wait(delay)

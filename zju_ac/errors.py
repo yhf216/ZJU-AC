@@ -15,3 +15,15 @@ class ProtocolError(ZjuError):
 
 class TemporaryError(ZjuError):
     """A transient network or server failure."""
+
+
+class PermissionDenied(ZjuError):
+    """The authenticated user cannot access an endpoint."""
+
+
+class CheckinRejected(ZjuError):
+    """The server explicitly rejected a check-in submission."""
+
+
+class SubmissionUncertain(ZjuError):
+    """The write may have reached the server; verify instead of retrying."""

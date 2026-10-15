@@ -21,7 +21,10 @@ class Notifier:
         title = "".join(c for c in rollcall.title if c.isprintable())[:160]
         rid = "".join(c for c in rollcall.id if c.isprintable())[:80]
         message = f"{course} · {rollcall.kind}签到 · {title}（编号 {rid}）"
-        print(f"[{stamp}] 签到提醒：{message}\n请在畅课或学在浙大中完成签到。", flush=True)
+        print(
+            f"[{stamp}] 签到提醒：{message}\n请查看终端处理提示，或在畅课/学在浙大中完成签到。",
+            flush=True,
+        )
         if self.bell:
             print("\a", end="", flush=True)
         if self.desktop:
