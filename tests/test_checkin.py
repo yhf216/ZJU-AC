@@ -3,13 +3,15 @@ from unittest.mock import Mock
 
 import pytest
 
-from zju_ac.checkin import Answer, NumericCheckin, Prompt, TerminalPrompts
+from zju_ac.checkin import Answer, ConfirmedCheckin, Prompt, TerminalPrompts
 from zju_ac.errors import (
     AuthenticationExpired,
     CheckinRejected,
+    ProtocolError,
     SubmissionUncertain,
     TemporaryError,
 )
+from zju_ac.gps import PROBES, Coordinates, distance_metres
 from zju_ac.models import Rollcall
 
 RECORD = Rollcall("42", "测试课程", "签到", "数字", course_id="7")
@@ -41,9 +43,9 @@ def workflow():
     client.fresh_number.return_value = RECORD
     client.my_rollcall_status.return_value = "absent"
     client.read_number_code.return_value = "0123"
-    client.verify_number.return_value = True
+    client.verify_attendance.return_value = True
     prompts = FakePrompts()
-    checkin = NumericCheckin(client, prompts)
+    checkin = ConfirmedCheckin(client, prompts)
     checkin.observe([RECORD])
     return client, prompts, checkin
 
@@ -73,7 +75,7 @@ def test_yes_submits_once_and_verifies(workflow, capsys):
     checkin.observe([RECORD])
     checkin.process()
     client.submit_number.assert_called_once_with(RECORD, "0123")
-    client.verify_number.assert_called_once_with(RECORD)
+    client.verify_attendance.assert_called_once_with(RECORD)
     assert "签到成功" in capsys.readouterr().out
 
 
@@ -143,13 +145,13 @@ def test_write_timeout_only_verifies_and_never_retries(workflow, capsys):
     prompts.reply("y")
     checkin.process()
     client.submit_number.assert_called_once()
-    client.verify_number.assert_called_once()
+    client.verify_attendance.assert_called_once()
     assert "签到成功" in capsys.readouterr().out
 
 
 def test_http_200_without_confirmed_status_does_not_report_success(workflow, capsys):
     client, prompts, checkin = workflow
-    client.verify_number.return_value = False
+    client.verify_attendance.return_value = False
     prompts.reply("y")
     checkin.process()
     output = capsys.readouterr().out
@@ -159,7 +161,7 @@ def test_http_200_without_confirmed_status_does_not_report_success(workflow, cap
 
 def test_verification_network_failure_is_pending_not_success(workflow, capsys):
     client, prompts, checkin = workflow
-    client.verify_number.side_effect = TemporaryError("offline")
+    client.verify_attendance.side_effect = TemporaryError("offline")
     prompts.reply("y")
     checkin.process()
     assert "待核验" in capsys.readouterr().out
@@ -173,7 +175,7 @@ def test_rejected_code_does_not_stop_monitor_or_retry(workflow, capsys):
     checkin.process()
     assert "未完成" in capsys.readouterr().out
     client.submit_number.assert_called_once()
-    client.verify_number.assert_not_called()
+    client.verify_attendance.assert_not_called()
 
 
 def test_expired_session_propagates_to_main(workflow):
@@ -193,10 +195,11 @@ def test_eof_cancels_pending_decisions(workflow):
     client.submit_number.assert_not_called()
 
 
-def test_only_numeric_activities_get_confirmation(workflow):
+def test_gps_gets_confirmation_but_qr_does_not(workflow):
     _, prompts, checkin = workflow
     checkin.observe([Rollcall("43", "课程", "签到", "GPS")])
-    assert len(prompts.requests) == 1
+    checkin.observe([Rollcall("44", "课程", "签到", "二维码")])
+    assert len(prompts.requests) == 2
 
 
 def test_waiting_for_terminal_input_does_not_block_main_thread(monkeypatch):
@@ -234,18 +237,20 @@ def test_activity_closes_during_automatic_code_lookup(workflow):
     client.submit_number.assert_not_called()
 
 
-def test_real_input_worker_delivers_confirmation_while_monitor_runs(monkeypatch):
+@pytest.mark.parametrize("kind", ["数字", "GPS"])
+def test_real_input_worker_delivers_confirmation_while_monitor_runs(monkeypatch, kind):
     from zju_ac.monitor import run_monitor
 
     client, notifier = Mock(), Mock()
     finished = threading.Event()
     request_threads = []
     main_thread = threading.get_ident()
+    record = Rollcall("42", "测试课程", "签到", kind, course_id="7")
 
     def rollcalls():
         if finished.is_set():
             raise KeyboardInterrupt
-        return [RECORD]
+        return [record]
 
     def submit(*args):
         request_threads.append(threading.get_ident())
@@ -255,18 +260,175 @@ def test_real_input_worker_delivers_confirmation_while_monitor_runs(monkeypatch)
         return True
 
     client.rollcalls.side_effect = rollcalls
-    client.fresh_number.return_value = RECORD
+    client.fresh_number.return_value = record
+    client.fresh_gps.return_value = record
     client.my_rollcall_status.return_value = "absent"
     client.read_number_code.return_value = "0123"
     client.submit_number.side_effect = submit
-    client.verify_number.side_effect = verify
+    client.submit_gps.side_effect = submit
+    client.verify_attendance.side_effect = verify
     monkeypatch.setattr("builtins.input", lambda prompt: "y")
-    checkin = NumericCheckin(client)
+    checkin = ConfirmedCheckin(client)
     try:
         with pytest.raises(KeyboardInterrupt):
             run_monitor(client, notifier, interval=0.02, checkin=checkin)
     finally:
         checkin.close()
         checkin.prompts.worker.join(timeout=2)
-    client.submit_number.assert_called_once_with(RECORD, "0123")
+    if kind == "数字":
+        client.submit_number.assert_called_once_with(record, "0123")
+    else:
+        client.submit_gps.assert_called_once_with(record, PROBES[0])
+    notifier.send.assert_called_once_with(record)
     assert request_threads == [main_thread]
+
+
+GPS_RECORD = Rollcall("43", "测试课程", "定位签到", "GPS", course_id="7")
+
+
+@pytest.fixture
+def gps_workflow():
+    client = Mock()
+    client.fresh_gps.return_value = GPS_RECORD
+    client.my_rollcall_status.return_value = "absent"
+    client.verify_attendance.return_value = True
+    client.submit_gps.side_effect = [
+        *(distance_metres(p, Coordinates(30.3, 120.09), 6371000.0) for p in PROBES),
+        None,
+    ]
+    prompts = FakePrompts()
+    checkin = ConfirmedCheckin(client, prompts)
+    checkin.observe([GPS_RECORD])
+    return client, prompts, checkin
+
+
+@pytest.mark.parametrize("answer", ["", "n", "unexpected", None])
+def test_gps_no_probe_before_explicit_consent(gps_workflow, answer):
+    client, prompts, checkin = gps_workflow
+    checkin.process()
+    client.fresh_gps.assert_not_called()
+    client.submit_gps.assert_not_called()
+    prompts.reply(answer)
+    checkin.process()
+    checkin.observe([GPS_RECORD])
+    client.submit_gps.assert_not_called()
+    assert len(prompts.requests) == 1
+
+
+def test_gps_three_probes_then_one_fitted_position_and_own_verification(gps_workflow, capsys):
+    client, prompts, checkin = gps_workflow
+    prompts.reply("y")
+    checkin.process()
+    checkin.observe([GPS_RECORD])
+    assert client.submit_gps.call_count == 4
+    assert client.fresh_gps.call_count == 4
+    assert client.my_rollcall_status.call_count == 4
+    assert [call.args[1] for call in client.submit_gps.call_args_list[:3]] == list(PROBES)
+    assert (
+        distance_metres(client.submit_gps.call_args.args[1], Coordinates(30.3, 120.09), 6371000) < 1
+    )
+    client.verify_attendance.assert_called_once_with(GPS_RECORD)
+    client.submit_number.assert_not_called()
+    output = capsys.readouterr().out
+    assert "[签到成功]" in output
+    assert "120.09" not in output
+    assert len(prompts.requests) == 1
+
+
+@pytest.mark.parametrize("verified", [True, False])
+def test_probe_can_sign_and_200_never_authorizes_further_positions(gps_workflow, capsys, verified):
+    client, prompts, checkin = gps_workflow
+    client.submit_gps.side_effect = [None]
+    client.verify_attendance.return_value = verified
+    prompts.reply("yes")
+    checkin.process()
+    client.submit_gps.assert_called_once()
+    client.verify_attendance.assert_called_once()
+    assert ("[签到成功]" in capsys.readouterr().out) is verified
+
+
+@pytest.mark.parametrize("index", range(4))
+def test_uncertain_gps_write_stops_sequence_and_only_verifies(gps_workflow, index):
+    client, prompts, checkin = gps_workflow
+    distances = [distance_metres(p, Coordinates(30.3, 120.09), 6371000.0) for p in PROBES]
+    client.submit_gps.side_effect = distances[:index] + [SubmissionUncertain("uncertain")]
+    prompts.reply("y")
+    checkin.process()
+    assert client.submit_gps.call_count == index + 1
+    client.verify_attendance.assert_called_once()
+
+
+@pytest.mark.parametrize("index", range(4))
+def test_activity_closing_between_positions_cancels_remaining_requests(gps_workflow, index):
+    client, prompts, checkin = gps_workflow
+    client.fresh_gps.side_effect = [GPS_RECORD] * index + [None]
+    prompts.reply("y")
+    checkin.process()
+    assert client.submit_gps.call_count == index
+
+
+@pytest.mark.parametrize(
+    "status", [None, "on_call", "on_call_fine", "on_personal_leave", "unknown"]
+)
+def test_gps_own_status_must_be_absent_before_each_position(gps_workflow, status):
+    client, prompts, checkin = gps_workflow
+    client.my_rollcall_status.side_effect = ["absent", status]
+    prompts.reply("y")
+    checkin.process()
+    client.submit_gps.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "failure", [ProtocolError("distance missing"), CheckinRejected("device blocked")]
+)
+def test_missing_distance_or_device_rejection_stops_but_monitor_remains_active(
+    gps_workflow, failure
+):
+    client, prompts, checkin = gps_workflow
+    client.submit_gps.side_effect = failure
+    prompts.reply("y")
+    checkin.process()
+    client.submit_gps.assert_called_once()
+    client.verify_attendance.assert_not_called()
+    assert not checkin.closed
+
+
+def test_bad_distance_consistency_prevents_final_write(gps_workflow, capsys):
+    client, prompts, checkin = gps_workflow
+    client.submit_gps.side_effect = [100, 200, 300]
+    prompts.reply("y")
+    checkin.process()
+    assert client.submit_gps.call_count == 3
+    assert "[签到成功]" not in capsys.readouterr().out
+
+
+def test_gps_candidate_rejected_outside_scope_has_no_more_attempts(gps_workflow, capsys):
+    client, prompts, checkin = gps_workflow
+    client.submit_gps.side_effect = [
+        *(distance_metres(p, Coordinates(30.3, 120.09), 6371000.0) for p in PROBES),
+        100,
+    ]
+    prompts.reply("y")
+    checkin.process()
+    assert client.submit_gps.call_count == 4
+    assert "仍被判为范围外" in capsys.readouterr().out
+    client.verify_attendance.assert_not_called()
+
+
+def test_numeric_and_gps_share_input_queue_and_keep_decisions_separate(workflow):
+    client, prompts, checkin = workflow
+    checkin.observe([GPS_RECORD])
+    client.fresh_gps.return_value = GPS_RECORD
+    client.submit_gps.return_value = None
+    client.verify_attendance.return_value = True
+    prompts.answers.extend([Answer(prompts.requests[0], "n"), Answer(prompts.requests[1], "y")])
+    checkin.process()
+    client.submit_number.assert_not_called()
+    client.submit_gps.assert_called_once()
+
+
+def test_gps_prompt_discloses_writes_and_location_method():
+    message = Prompt(GPS_RECORD).message()
+    assert "最多发送 4 次" in message
+    assert "探测也可能直接完成签到" in message
+    assert "不读取本机真实位置" in message

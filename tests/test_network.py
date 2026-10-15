@@ -7,6 +7,7 @@ import requests
 
 from zju_ac.auth import HttpAuthenticator
 from zju_ac.client import CoursesClient
+from zju_ac.gps import Coordinates
 from zju_ac.models import Rollcall
 from zju_ac.network import configure_direct_session, create_direct_session
 
@@ -40,7 +41,7 @@ def fake_transport(session):
     return session.send
 
 
-@pytest.mark.parametrize("operation", ["auth_get", "auth_post", "profile", "poll", "submit"])
+@pytest.mark.parametrize("operation", ["auth_get", "auth_post", "profile", "poll", "submit", "gps"])
 def test_all_application_requests_ignore_invalid_proxies(proxy_environment, operation):
     session = requests.Session()
     session.proxies["https"] = "http://127.0.0.1:8"
@@ -59,6 +60,10 @@ def test_all_application_requests_ignore_invalid_proxies(proxy_environment, oper
                 client.profile()
             elif operation == "poll":
                 client.rollcalls()
+            elif operation == "gps":
+                client.submit_gps(
+                    Rollcall("42", "课程", "签到", "GPS", course_id="7"), Coordinates(30.3, 120.09)
+                )
             else:
                 client.submit_number(Rollcall("42", "课程", "签到", "数字", course_id="7"), "0123")
         send.assert_called_once()

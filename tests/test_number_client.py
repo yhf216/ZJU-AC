@@ -150,7 +150,7 @@ def test_verification_reads_only_own_records_with_pagination():
         json_response({"rollcalls": [{"id": i, "status": "absent"} for i in range(100, 200)]}),
         json_response({"rollcalls": [{"id": 42, "status": "on_call_fine"}]}),
     ]
-    assert CoursesClient(session).verify_number(RECORD)
+    assert CoursesClient(session).verify_attendance(RECORD)
     assert session.get.call_args.args == (BASE_URL + "/api/course/7/student/99/rollcalls",)
     assert session.get.call_args.kwargs["params"] == {"page": 2, "page_size": 100}
     session.put.assert_not_called()
@@ -160,7 +160,7 @@ def test_verification_waits_for_own_status_not_activity_status(monkeypatch):
     client = CoursesClient(Mock())
     client.my_rollcall_status = Mock(side_effect=["absent", "absent", "on_call"])
     monkeypatch.setattr("zju_ac.client.time.sleep", Mock())
-    assert client.verify_number(RECORD)
+    assert client.verify_attendance(RECORD)
     assert client.my_rollcall_status.call_count == 3
 
 
@@ -168,7 +168,7 @@ def test_absence_from_active_list_does_not_count_as_success(monkeypatch):
     client = CoursesClient(Mock())
     client.my_rollcall_status = Mock(return_value=None)
     monkeypatch.setattr("zju_ac.client.time.sleep", Mock())
-    assert not client.verify_number(RECORD)
+    assert not client.verify_attendance(RECORD)
 
 
 def test_freshness_check_rejects_type_or_course_changes():

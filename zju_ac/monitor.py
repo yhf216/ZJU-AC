@@ -4,7 +4,7 @@ import logging
 import time
 from collections import OrderedDict
 
-from .checkin import NumericCheckin
+from .checkin import ConfirmedCheckin
 from .client import CoursesClient
 from .errors import TemporaryError
 from .models import Rollcall
@@ -35,7 +35,7 @@ def run_monitor(
     interval: float = 15,
     repeat_after: float = 0,
     once: bool = False,
-    checkin: NumericCheckin | None = None,
+    checkin: ConfirmedCheckin | None = None,
 ) -> None:
     tracker = ReminderTracker(repeat_after)
     failures = 0

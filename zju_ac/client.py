@@ -1,4 +1,4 @@
-"""Authenticated course queries and explicit numeric attendance submissions."""
+"""Authenticated course queries and explicit attendance submissions."""
 
 import logging
 import re
@@ -17,6 +17,7 @@ from .errors import (
     SubmissionUncertain,
     TemporaryError,
 )
+from .gps import Coordinates, valid_distance
 from .models import SIGNED, Rollcall, active_rollcalls
 from .network import configure_direct_session
 
@@ -70,7 +71,9 @@ class CoursesClient:
         return self._read_response(response)
 
     @staticmethod
-    def _read_response(response: requests.Response, submitting: bool = False) -> Any:
+    def _read_response(
+        response: requests.Response, submitting: bool = False, gps: bool = False
+    ) -> Any:
         try:
             if response.status_code in {301, 302, 303, 307, 308, 401}:
                 raise AuthenticationExpired("登录会话已失效，请重新运行并登录。")
@@ -82,10 +85,10 @@ class CoursesClient:
                         "提交结果不确定，正在回查本人状态，不会自动重复提交。"
                     )
                 raise TemporaryError(f"服务暂时不可用（HTTP {response.status_code}）。")
-            if response.status_code != 200:
+            if response.status_code != 200 and not (gps and response.status_code == 400):
                 if submitting:
                     raise CheckinRejected(
-                        f"签到提交被拒绝（HTTP {response.status_code}），请核对数字码。"
+                        f"签到提交被拒绝（HTTP {response.status_code}），请核对活动状态。"
                     )
                 raise ProtocolError(f"接口请求失败（HTTP {response.status_code}）。")
             if "json" not in response.headers.get("content-type", "").lower():
@@ -98,11 +101,20 @@ class CoursesClient:
                 if submitting:
                     raise SubmissionUncertain("提交响应无法解析，正在回查本人状态。") from exc
                 raise ProtocolError("接口返回了无效 JSON。") from exc
-            if isinstance(payload, dict) and (
-                payload.get("error_code") or payload.get("success") is False
+            # Only this explicit, known rejection permits another GPS position.
+            # A distance attached to any other error must never bypass that error.
+            if (
+                gps
+                and isinstance(payload, dict)
+                and payload.get("error_code") == "radar_out_of_scope"
+            ):
+                return payload
+            if response.status_code != 200 or (
+                isinstance(payload, dict)
+                and (payload.get("error_code") or payload.get("success") is False)
             ):
                 if submitting:
-                    raise CheckinRejected("服务端拒绝签到，请核对数字码及活动状态。")
+                    raise CheckinRejected("服务端拒绝签到，请核对签到要求、设备限制及活动状态。")
                 raise ProtocolError("接口返回业务错误，请核对平台接口。")
             return payload
         finally:
@@ -119,6 +131,12 @@ class CoursesClient:
         return active_rollcalls(self.get_json("/api/radar/rollcalls"))
 
     def fresh_number(self, record: Rollcall) -> Rollcall | None:
+        return self._fresh(record, "数字")
+
+    def fresh_gps(self, record: Rollcall) -> Rollcall | None:
+        return self._fresh(record, "GPS")
+
+    def _fresh(self, record: Rollcall, kind: str) -> Rollcall | None:
         """Recheck after the user's potentially long wait before any write."""
         api_id(record.id)
         api_id(record.course_id)
@@ -126,7 +144,7 @@ class CoursesClient:
             (
                 rc
                 for rc in self.rollcalls()
-                if rc.id == record.id and rc.course_id == record.course_id and rc.kind == "数字"
+                if rc.id == record.id and rc.course_id == record.course_id and rc.kind == kind
             ),
             None,
         )
@@ -205,7 +223,48 @@ class CoursesClient:
             raise SubmissionUncertain("提交连接中断，正在回查本人状态，不会自动重复提交。") from exc
         self._read_response(response, submitting=True)
 
-    def verify_number(self, record: Rollcall) -> bool:
+    def submit_gps(self, record: Rollcall, coordinates: Coordinates) -> float | None:
+        """One write. A distance means explicit out-of-scope; None requires verification."""
+        rid = api_id(record.id)
+        api_id(record.course_id)
+        if record.kind != "GPS":
+            raise ProtocolError("仅支持向 GPS 活动提交定位。")
+        try:
+            response = self.session.put(
+                f"{BASE_URL}/api/rollcall/{rid}/answer",
+                params={"api_version": "1.1.2"},
+                json={
+                    "deviceId": self.device_id,
+                    "latitude": coordinates.latitude,
+                    "longitude": coordinates.longitude,
+                    "accuracy": 35,
+                    "altitude": None,
+                    "altitudeAccuracy": None,
+                    "heading": None,
+                    "speed": None,
+                },
+                timeout=self.timeout,
+                allow_redirects=False,
+                headers={"Accept": "application/json"},
+            )
+        except requests.RequestException as exc:
+            raise SubmissionUncertain(
+                "GPS 提交连接中断，正在回查本人状态，不会继续定位请求。"
+            ) from exc
+        payload = self._read_response(response, submitting=True, gps=True)
+        if isinstance(payload, dict) and payload.get("error_code") == "radar_out_of_scope":
+            containers = [payload, payload.get("data"), payload.get("result")]
+            distances = [
+                valid_distance(item["distance"])
+                for item in containers
+                if isinstance(item, dict) and "distance" in item
+            ]
+            if not distances or any(value != distances[0] for value in distances):
+                raise ProtocolError("GPS 范围外响应缺少明确的有效距离，已停止本次尝试。")
+            return distances[0]
+        return None
+
+    def verify_attendance(self, record: Rollcall) -> bool:
         for attempt in range(3):
             if self.my_rollcall_status(record) in SIGNED:
                 return True

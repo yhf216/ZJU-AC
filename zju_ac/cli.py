@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--login-timeout", type=seconds, default=180, help="登录等待秒数，默认 180")
     result.add_argument("--once", action="store_true", help="登录后查询一次并退出")
     result.add_argument(
-        "--reminders-only", action="store_true", help="仅提醒，不询问或提交数字签到"
+        "--reminders-only", action="store_true", help="仅提醒，不询问或提交数字及 GPS 签到"
     )
     result.add_argument("--demo", action="store_true", help="离线演示提醒，无需登录")
     result.add_argument("--no-desktop", action="store_true", help="关闭桌面通知")
@@ -78,7 +78,7 @@ def run_application(
     try:
         # Import runtime dependencies before requesting any credentials.
         from .auth import login
-        from .checkin import NumericCheckin
+        from .checkin import ConfirmedCheckin
         from .monitor import run_monitor
 
         if credentials is None:
@@ -92,7 +92,7 @@ def run_application(
             return run_watchdog(args, Credentials(student_id, password))
         with login(student_id, password, args.login_timeout) as client:
             password = ""
-            checkin = None if args.reminders_only or args.once else NumericCheckin(client)
+            checkin = None if args.reminders_only or args.once else ConfirmedCheckin(client)
             try:
                 run_monitor(
                     client,

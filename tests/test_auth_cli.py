@@ -137,7 +137,7 @@ def test_read_only_modes_do_not_construct_submission_handler(monkeypatch, option
     monkeypatch.setattr("getpass.getpass", lambda prompt: "dummy-password")
     monkeypatch.setattr(auth, "login", fake_login)
     handler = Mock(side_effect=AssertionError("Submission handler must not be constructed"))
-    monkeypatch.setattr(checkin, "NumericCheckin", handler)
+    monkeypatch.setattr(checkin, "ConfirmedCheckin", handler)
     run = Mock()
     monkeypatch.setattr(monitor, "run_monitor", run)
     assert main(["--no-watchdog", *options]) == 0
