@@ -1,7 +1,7 @@
 """Validate root UTF-8 TOML settings before requesting credentials."""
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import ZjuError
@@ -19,13 +19,23 @@ class GpsSettings:
 
 
 @dataclass(frozen=True)
+class GateSettings:
+    signed_ratio: float = 0.25
+    signed_count: int = 20
+    max_wait_seconds: int = 120
+    min_remaining_seconds: int = 30
+    poll_interval_seconds: int = 5
+
+
+@dataclass(frozen=True)
 class Settings:
     mode: str = "monitor"
     interval: int = 15
     remind_every: int = 0
     login_timeout: int = 180
-    auto_checkin: bool = False
-    gate: str = "immediate"
+    auto_checkin: bool = True
+    gate: str = "attendance"
+    gate_settings: GateSettings = field(default_factory=GateSettings)
     desktop: bool = True
     bell: bool = True
     watchdog: bool = True
@@ -112,7 +122,21 @@ def load_config(path: Path | None = None) -> Settings:
     if data.keys() - {"runtime", "checkin", "notifications", "watchdog", "gps"}:
         raise ZjuError("config.toml 存在未知配置节，请对照项目示例。")
     runtime = _table(data, "runtime", {"mode", "interval", "remind_every", "login_timeout"})
-    checkin = _table(data, "checkin", {"auto_checkin", "gate"})
+    checkin = _table(data, "checkin", {"auto_checkin", "gate", "gate_settings"})
+    gate = _table(
+        checkin,
+        "gate_settings",
+        {
+            "signed_ratio",
+            "signed_count",
+            "max_wait_seconds",
+            "min_remaining_seconds",
+            "poll_interval_seconds",
+        },
+    )
+    ratio = gate.get("signed_ratio", 0.25)
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0 <= ratio <= 1:
+        raise ZjuError("config.toml 的 signed_ratio 必须为 0 到 1 之间的数值。")
     notifications = _table(data, "notifications", {"desktop", "bell"})
     watchdog = _table(data, "watchdog", {"enabled", "restart_delay", "max_restarts"})
     return Settings(
@@ -120,8 +144,15 @@ def load_config(path: Path | None = None) -> Settings:
         interval=_integer(runtime, "interval", 15, 5),
         remind_every=_integer(runtime, "remind_every", 0, 5, zero=True),
         login_timeout=_integer(runtime, "login_timeout", 180, 5),
-        auto_checkin=_boolean(checkin, "auto_checkin", False),
-        gate=_choice(checkin, "gate", "immediate", {"immediate"}),
+        auto_checkin=_boolean(checkin, "auto_checkin", True),
+        gate=_choice(checkin, "gate", "attendance", {"immediate", "attendance"}),
+        gate_settings=GateSettings(
+            signed_ratio=float(ratio),
+            signed_count=_integer(gate, "signed_count", 20, 0),
+            max_wait_seconds=_integer(gate, "max_wait_seconds", 120, 1),
+            min_remaining_seconds=_integer(gate, "min_remaining_seconds", 30, 0),
+            poll_interval_seconds=_integer(gate, "poll_interval_seconds", 5, 1),
+        ),
         desktop=_boolean(notifications, "desktop", True),
         bell=_boolean(notifications, "bell", True),
         watchdog=_boolean(watchdog, "enabled", True),

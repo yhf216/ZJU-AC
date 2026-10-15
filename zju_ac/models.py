@@ -24,6 +24,13 @@ class Rollcall:
     started_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class AttendanceProgress:
+    signed: int
+    total: int
+    ends_at: datetime | None = None
+
+
 def parse_time(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
@@ -33,6 +40,43 @@ def parse_time(value: Any) -> datetime | None:
         return parsed if parsed.tzinfo is not None else None
     except ValueError:
         return None
+
+
+def attendance_progress(payload: Any) -> AttendanceProgress | None:
+    """Reduce a full roster to counts; never infer attendance from status/timestamps."""
+    if not isinstance(payload, dict):
+        return None
+    containers = [payload]
+    if isinstance(payload.get("data"), dict):
+        containers.append(payload["data"])
+    container = next((item for item in containers if "student_rollcalls" in item), None)
+    if container is None:
+        return None
+    students = container["student_rollcalls"]
+    if not isinstance(students, list) or not students:
+        return None
+    # Do not use a known partial page as the whole-class denominator.
+    for item in containers:
+        pagination = item.get("pagination")
+        metadata = [item, pagination] if isinstance(pagination, dict) else [item]
+        for meta in metadata:
+            if meta.get("has_more") is True or meta.get("next_page"):
+                return None
+            for key in ("total", "total_count"):
+                if key in meta and (type(meta[key]) is not int or meta[key] != len(students)):
+                    return None
+    statuses = []
+    for student in students:
+        if not isinstance(student, dict):
+            return None
+        status = student.get("rollcall_status")
+        if not isinstance(status, str) or not status.strip():
+            return None
+        statuses.append(status.strip().lower())
+    ends = [end for item in containers if (end := parse_time(item.get("end_time"))) is not None]
+    return AttendanceProgress(
+        statuses.count("on_call_fine"), len(students), min(ends) if ends else None
+    )
 
 
 def active_rollcalls(payload: Any, now: datetime | None = None) -> list[Rollcall]:

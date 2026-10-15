@@ -154,6 +154,15 @@ def test_full_workflow_with_real_client_and_simulated_http_backend(capsys, autom
     def get(url, **options):
         if url.endswith("/api/profile"):
             return response({"id": 99})
+        if url.endswith("/api/rollcall/42/student_rollcalls"):
+            return response(
+                {
+                    "student_rollcalls": [
+                        {"rollcall_status": "on_call_fine" if n < 21 else "absent"}
+                        for n in range(80)
+                    ]
+                }
+            )
         if url.endswith("/api/radar/rollcalls"):
             return response(
                 {

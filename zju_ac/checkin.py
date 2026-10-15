@@ -3,14 +3,14 @@
 import queue
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from .client import CoursesClient, number_code
 from .config import Settings
 from .errors import AuthenticationExpired, SubmissionUncertain, ZjuError
-from .gate import allows_auto_checkin
-from .models import SIGNED, Rollcall
+from .gate import WaitingActivity, deadline_decision, evaluate_gate
+from .models import SIGNED, AttendanceProgress, Rollcall
 
 
 def display(value: str) -> str:
@@ -95,7 +95,7 @@ class ConfirmedCheckin:
         self.client = client
         self.settings = settings if settings is not None else Settings()
         self.prompts = prompts if prompts is not None else TerminalPrompts()
-        self.automatic: deque[Rollcall] = deque()
+        self.automatic: dict[str, WaitingActivity] = {}
         self.asked: set[str] = set()
         self.pending: dict[str, Prompt] = {}
         self.closed = False
@@ -103,12 +103,20 @@ class ConfirmedCheckin:
     def observe(self, records: list[Rollcall]) -> None:
         if self.closed:
             return
+        live = {record.id for record in records}
+        for rid in self.automatic.keys() - live:
+            self.automatic.pop(rid)
+            print(f"[门控取消] 活动 {display(rid)} 已不在待签到列表。", flush=True)
         for record in records:
+            if record.id in self.automatic:
+                previous = self.automatic[record.id].record
+                if previous.kind != record.kind or previous.course_id != record.course_id:
+                    self.automatic.pop(record.id)
+                    print(f"[门控取消] 活动 {display(record.id)} 类型或课程已变化。", flush=True)
+                else:
+                    self.automatic[record.id].record = record
+                continue
             if record.kind in {"数字", "GPS"} and record.id not in self.asked:
-                if self.settings.auto_checkin and not allows_auto_checkin(
-                    record, self.settings.gate
-                ):
-                    continue
                 self.asked.add(record.id)
                 if record.kind == "GPS":
                     if self.settings.gps is None:
@@ -116,7 +124,7 @@ class ConfirmedCheckin:
                         continue
                     print(f"GPS 将使用地点：{display(self.settings.gps.name)}。", flush=True)
                 if self.settings.auto_checkin:
-                    self.automatic.append(record)
+                    self.automatic[record.id] = WaitingActivity(record, time.monotonic())
                 else:
                     self._ask(Prompt(record))
 
@@ -127,10 +135,7 @@ class ConfirmedCheckin:
     def process(self) -> None:
         if self.closed:
             return
-        while self.automatic:
-            record = self.automatic.popleft()
-            print(f"自动处理{record.kind}签到（编号 {display(record.id)}）。", flush=True)
-            self._submit(record)
+        self._process_automatic()
         for answer in self.prompts.poll():
             prompt = answer.prompt
             if self.pending.get(prompt.record.id) != prompt:
@@ -154,6 +159,31 @@ class ConfirmedCheckin:
                     print("数字码为空或格式无效，已取消本次提交。", flush=True)
                     continue
             self._submit(prompt.record, code)
+
+    def _process_automatic(self) -> None:
+        policy = self.settings.gate_settings
+        for rid, activity in list(self.automatic.items()):
+            now, now_utc = time.monotonic(), datetime.now(UTC)
+            decision = deadline_decision(activity, policy, self.settings.gate, now, now_utc)
+            if decision is None:
+                if now < activity.next_check_at:
+                    continue
+                progress = self.client.attendance_progress(activity.record)
+                if isinstance(progress, AttendanceProgress) and progress.ends_at is not None:
+                    activity.roster_ends_at = progress.ends_at
+                # A roster read may take time; evaluate deadlines after it finishes too.
+                now, now_utc = time.monotonic(), datetime.now(UTC)
+                decision = evaluate_gate(
+                    activity, policy, self.settings.gate, progress, now, now_utc
+                )
+            print(f"[门控] 活动 {display(rid)}：{decision.reason}。", flush=True)
+            if decision.action == "wait":
+                activity.next_check_at = now + policy.poll_interval_seconds
+                continue
+            self.automatic.pop(rid)
+            if decision.action == "submit":
+                print(f"自动处理{activity.record.kind}签到（编号 {display(rid)}）。", flush=True)
+                self._submit(activity.record)
 
     def _submit(self, record: Rollcall, code: str | None = None) -> None:
         try:

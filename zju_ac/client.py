@@ -18,7 +18,7 @@ from .errors import (
     TemporaryError,
 )
 from .gps import Coordinates
-from .models import SIGNED, Rollcall, active_rollcalls
+from .models import SIGNED, AttendanceProgress, Rollcall, active_rollcalls, attendance_progress
 from .network import configure_direct_session
 
 BASE_URL = "https://courses.zju.edu.cn"
@@ -127,6 +127,16 @@ class CoursesClient:
 
     def rollcalls(self) -> list[Rollcall]:
         return active_rollcalls(self.get_json("/api/radar/rollcalls"))
+
+    def attendance_progress(self, record: Rollcall) -> AttendanceProgress | None:
+        try:
+            rid = api_id(record.id)
+            api_id(record.course_id)
+            return attendance_progress(self.get_json(f"/api/rollcall/{rid}/student_rollcalls"))
+        except (PermissionDenied, ProtocolError, TemporaryError):
+            # Per user policy, unavailable roster data releases only the gate.
+            # Activity and own attendance still must be checked before submission.
+            return None
 
     def fresh_number(self, record: Rollcall) -> Rollcall | None:
         return self._fresh(record, "数字")

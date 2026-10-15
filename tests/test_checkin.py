@@ -15,7 +15,7 @@ from zju_ac.gps import Coordinates
 from zju_ac.models import Rollcall
 
 GPS_SETTINGS = GpsSettings("test", "Test location", Coordinates(30.3, 120.09))
-SETTINGS = Settings(gps=GPS_SETTINGS)
+SETTINGS = Settings(auto_checkin=False, gate="immediate", gps=GPS_SETTINGS)
 
 RECORD = Rollcall("42", "测试课程", "签到", "数字", course_id="7")
 
@@ -402,26 +402,6 @@ def test_automatic_mode_submits_once_without_terminal_input(kind):
         client.submit_gps.assert_called_once_with(record, GPS_SETTINGS.coordinates, accuracy=35.0)
         client.submit_number.assert_not_called()
     client.verify_attendance.assert_called_once()
-
-
-def test_gate_wait_keeps_activity_eligible_for_next_poll(monkeypatch):
-    from dataclasses import replace
-
-    client, prompts = Mock(), FakePrompts()
-    client.fresh_number.return_value = RECORD
-    client.my_rollcall_status.return_value = "absent"
-    client.read_number_code.return_value = "0123"
-    allowed = Mock(side_effect=[False, True])
-    monkeypatch.setattr("zju_ac.checkin.allows_auto_checkin", allowed)
-    checkin = ConfirmedCheckin(client, prompts, settings=replace(SETTINGS, auto_checkin=True))
-    checkin.observe([RECORD])
-    checkin.process()
-    client.read_number_code.assert_not_called()
-    client.submit_number.assert_not_called()
-    checkin.observe([RECORD])
-    checkin.process()
-    client.submit_number.assert_called_once()
-    assert prompts.requests == []
 
 
 def test_auto_missing_code_never_prompts_or_guesses(capsys):

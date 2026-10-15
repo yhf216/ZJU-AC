@@ -7,7 +7,7 @@ import pytest
 from zju_ac import cli
 from zju_ac.config import CONFIG_PATH, GpsSettings, Settings, load_config
 from zju_ac.errors import ZjuError
-from zju_ac.gate import allows_auto_checkin
+from zju_ac.gate import WaitingActivity, deadline_decision
 from zju_ac.gps import Coordinates
 from zju_ac.models import Rollcall
 
@@ -18,13 +18,17 @@ def read_settings(tmp_path, content):
     return load_config(path)
 
 
-def test_project_config_contains_manual_default_and_selected_reference_coordinates():
+def test_project_config_enables_automatic_attendance_gate_and_preserves_selected_location():
     config = load_config()
-    assert not config.auto_checkin
-    assert config.gate == "immediate"
+    assert config.auto_checkin
+    assert config.gate == "attendance"
     assert config.watchdog
-    assert config.gps.location == "ZJGD1"
-    assert config.gps.coordinates == Coordinates(30.302331, 120.089136)
+    assert config.gps.location
+    assert config.gps.name
+    assert config.gate_settings.signed_ratio == 0.25
+    assert config.gate_settings.signed_count == 20
+    assert config.gate_settings.max_wait_seconds == 120
+    assert config.gate_settings.min_remaining_seconds == 30
 
 
 def test_config_path_does_not_depend_on_shell_working_directory(tmp_path, monkeypatch):
@@ -67,6 +71,7 @@ longitude = 120.1
         remind_every=60,
         login_timeout=120,
         auto_checkin=True,
+        gate="immediate",
         desktop=False,
         bell=False,
         watchdog=False,
@@ -147,8 +152,18 @@ def test_config_snapshot_is_picklable_for_watchdog_worker():
 
 
 def test_unknown_gate_fails_instead_of_defaulting_to_immediate():
+    from datetime import UTC, datetime
+
+    from zju_ac.config import GateSettings
+
     with pytest.raises(ZjuError):
-        allows_auto_checkin(Rollcall("1", "课程", "签到", "数字"), "unknown")
+        deadline_decision(
+            WaitingActivity(Rollcall("1", "课程", "签到", "数字"), 0),
+            GateSettings(),
+            "unknown",
+            0,
+            datetime.now(UTC),
+        )
 
 
 @pytest.mark.parametrize(
@@ -166,3 +181,60 @@ def test_unknown_gate_fails_instead_of_defaulting_to_immediate():
 def test_operational_flags_rejected_in_favor_of_config(flag):
     with pytest.raises(SystemExit):
         cli.parser().parse_args([flag])
+
+
+def test_default_loader_enables_gated_automatic_mode(tmp_path):
+    from zju_ac.config import GateSettings
+
+    settings = read_settings(tmp_path, "")
+    assert settings.auto_checkin
+    assert settings.gate == "attendance"
+    assert settings.gate_settings == GateSettings()
+
+
+def test_all_gate_parameters_are_read_from_config(tmp_path):
+    from zju_ac.config import GateSettings
+
+    settings = read_settings(
+        tmp_path,
+        """
+[checkin]
+gate = "attendance"
+[checkin.gate_settings]
+signed_ratio = 0.4
+signed_count = 10
+max_wait_seconds = 90
+min_remaining_seconds = 15
+poll_interval_seconds = 3
+""",
+    )
+    assert settings.gate_settings == GateSettings(0.4, 10, 90, 15, 3)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        'signed_ratio = "0.25"',
+        "signed_ratio = true",
+        "signed_ratio = -0.1",
+        "signed_ratio = 1.1",
+        "signed_ratio = nan",
+        "signed_ratio = inf",
+        "signed_count = -1",
+        "signed_count = true",
+        "signed_count = 1.5",
+        "max_wait_seconds = 0",
+        "max_wait_seconds = -1",
+        "max_wait_seconds = 1.5",
+        "min_remaining_seconds = -1",
+        "min_remaining_seconds = true",
+        "poll_interval_seconds = 0",
+        "poll_interval_seconds = -1",
+        "poll_interval_seconds = true",
+        "poll_interval_seconds = 1.5",
+        "unknown = 1",
+    ],
+)
+def test_invalid_gate_numbers_rejected_before_login(tmp_path, entry):
+    with pytest.raises(ZjuError):
+        read_settings(tmp_path, "[checkin.gate_settings]\n" + entry)
