@@ -117,9 +117,12 @@ def test_credentials_are_not_in_repr_or_logs(monkeypatch, caplog):
     assert "private-student-id" not in caplog.text
 
 
-def test_worker_restores_interactive_terminal(monkeypatch):
+@pytest.mark.parametrize("reports_tty", [False, True])
+def test_worker_restores_interactive_terminal_even_if_null_device_reports_tty(
+    monkeypatch, reports_tty
+):
     original, terminal = Mock(), Mock()
-    original.isatty.return_value = False
+    original.isatty.return_value = reports_tty
     monkeypatch.setattr(sys, "stdin", original)
     opened = Mock(return_value=terminal)
     monkeypatch.setattr("builtins.open", opened)
@@ -128,6 +131,47 @@ def test_worker_restores_interactive_terminal(monkeypatch):
     assert sys.stdin is original
     assert opened.call_args.args == ("CONIN$" if os.name == "nt" else "/dev/tty",)
     terminal.close.assert_called_once()
+
+
+def test_worker_replaces_real_null_device_input(monkeypatch):
+    # NUL.isatty() is True on Windows; a mocked non-TTY missed this regression.
+    with open(os.devnull, encoding="utf-8") as null_input:
+        assert null_input.readline() == ""
+        monkeypatch.setattr(sys, "stdin", null_input)
+        terminal = Mock()
+        terminal.readline.return_value = "y\n"
+        opened = Mock(return_value=terminal)
+        monkeypatch.setattr("builtins.open", opened)
+        with watchdog.worker_terminal():
+            assert sys.stdin.readline() == "y\n"
+        assert sys.stdin is null_input
+        opened.assert_called_once_with(
+            "CONIN$" if os.name == "nt" else "/dev/tty", encoding="utf-8"
+        )
+        terminal.close.assert_called_once()
+
+
+def test_worker_restores_stdin_and_closes_terminal_after_failure(monkeypatch):
+    original, terminal = Mock(), Mock()
+    monkeypatch.setattr(sys, "stdin", original)
+    monkeypatch.setattr("builtins.open", Mock(return_value=terminal))
+    with pytest.raises(RuntimeError):
+        with watchdog.worker_terminal():
+            raise RuntimeError("offline failure")
+    assert sys.stdin is original
+    terminal.close.assert_called_once()
+
+
+def test_worker_cannot_silently_continue_with_unavailable_terminal(monkeypatch):
+    original = Mock()
+    original.isatty.return_value = True
+    monkeypatch.setattr(sys, "stdin", original)
+    monkeypatch.setattr("builtins.open", Mock(side_effect=OSError("private details")))
+    with pytest.raises(ZjuError, match="无法打开交互终端") as error:
+        with watchdog.worker_terminal():
+            pytest.fail("Missing terminal must stop startup")
+    assert "private details" not in str(error.value)
+    assert sys.stdin is original
 
 
 def test_worker_reports_terminal_unavailable_as_user_action(monkeypatch):
@@ -246,3 +290,82 @@ if __name__ == "__main__":
     assert "退出码 7" in result.stderr
     assert result.stderr.count("工作进程已启动") == 2
     assert "dummy-password" not in result.stderr
+
+
+def test_real_spawn_restores_input_for_confirmation_and_manual_code(tmp_path):
+    script = tmp_path / "watchdog_input.py"
+    script.write_text(
+        """
+import argparse
+import builtins
+import io
+import multiprocessing
+import os
+import sys
+import time
+from zju_ac import cli, watchdog
+from zju_ac.checkin import TerminalPrompts, Prompt
+from zju_ac.models import Rollcall
+
+def offline_application(args, credentials, supervised):
+    assert supervised
+    assert input("OTP: ") == "123456"
+    prompts = TerminalPrompts()
+    prompts.ask(Prompt(Rollcall("42", "Offline", "Number", "数字")))
+    prompts.ask(Prompt(Rollcall("43", "Offline", "GPS", "GPS")))
+    prompts.ask(Prompt(Rollcall("42", "Offline", "Code", "数字"), "code"))
+    answers = []
+    deadline = time.monotonic() + 3
+    try:
+        while len(answers) < 3 and time.monotonic() < deadline:
+            answers.extend(answer.value for answer in prompts.poll())
+            time.sleep(0.01)
+        assert answers == ["y", "n", "0123"], answers
+    finally:
+        prompts.close()
+        prompts.worker.join(timeout=1)
+    print("CONFIRMATION_INPUT_OK", flush=True)
+    return 0
+
+def child():
+    # A real spawn has already replaced stdin. On Windows this NUL device
+    # misleadingly reports isatty() == True, reproducing the original failure.
+    assert sys.stdin.readline() == ""
+    if os.name == "nt":
+        assert sys.stdin.isatty()
+    original_open = builtins.open
+    def fake_console_open(path, *args, **kwargs):
+        if path == ("CONIN$" if os.name == "nt" else "/dev/tty"):
+            return io.StringIO("123456\\ny\\nn\\n0123\\n")
+        return original_open(path, *args, **kwargs)
+    builtins.open = fake_console_open
+    cli.run_application = offline_application
+    watchdog.worker_entry(argparse.Namespace(), watchdog.Credentials("offline", "dummy"))
+
+if __name__ == "__main__":
+    process = multiprocessing.get_context("spawn").Process(target=child)
+    process.start()
+    process.join(timeout=6)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        raise SystemExit(1)
+    raise SystemExit(process.exitcode)
+""",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = (
+        str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH", "")
+    )
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-B", str(script)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CONFIRMATION_INPUT_OK" in result.stdout

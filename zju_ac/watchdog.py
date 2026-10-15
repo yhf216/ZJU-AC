@@ -24,18 +24,22 @@ class Credentials:
 
 @contextmanager
 def worker_terminal():
-    """multiprocessing replaces stdin; reopen the controlling terminal for confirmation/OTP."""
+    """Restore stdin after multiprocessing replaces it with the null device.
+
+    On Windows NUL is a character device and isatty() may return True. It
+    still returns EOF immediately, so that check cannot detect usable input.
+    This context is only used in the spawned worker: always reopen its terminal.
+    """
     original = sys.stdin
     terminal = None
     try:
-        if original is None or not original.isatty():
-            try:
-                terminal = open("CONIN$" if os.name == "nt" else "/dev/tty", encoding="utf-8")
-            except OSError as exc:
-                from .errors import ZjuError
+        try:
+            terminal = open("CONIN$" if os.name == "nt" else "/dev/tty", encoding="utf-8")
+        except OSError as exc:
+            from .errors import ZjuError
 
-                raise ZjuError("无法打开交互终端，请在普通终端中运行看门狗模式。") from exc
-            sys.stdin = terminal
+            raise ZjuError("无法打开交互终端，请在普通终端中运行看门狗模式。") from exc
+        sys.stdin = terminal
         yield
     finally:
         sys.stdin = original
