@@ -140,6 +140,6 @@ def test_read_only_modes_do_not_construct_submission_handler(monkeypatch, option
     monkeypatch.setattr(checkin, "NumericCheckin", handler)
     run = Mock()
     monkeypatch.setattr(monitor, "run_monitor", run)
-    assert main(options) == 0
+    assert main(["--no-watchdog", *options]) == 0
     handler.assert_not_called()
     assert run.call_args.kwargs["checkin"] is None

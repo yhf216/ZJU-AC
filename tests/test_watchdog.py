@@ -168,14 +168,15 @@ def test_supervised_exit_classification(monkeypatch, capsys, failure, code):
     assert "private-password" not in capsys.readouterr().err
 
 
-def test_cli_prompts_once_then_hands_credentials_to_supervisor(monkeypatch):
+@pytest.mark.parametrize("options", [[], ["--watchdog"], ["--reminders-only"]])
+def test_cli_prompts_once_then_hands_credentials_to_supervisor(monkeypatch, options):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     username, password = Mock(return_value="offline"), Mock(return_value="dummy")
     monkeypatch.setattr("builtins.input", username)
     monkeypatch.setattr("getpass.getpass", password)
     supervisor = Mock(return_value=0)
     monkeypatch.setattr(cli, "run_watchdog", supervisor)
-    assert cli.main(["--watchdog", "--reminders-only"]) == 0
+    assert cli.main(options) == 0
     username.assert_called_once()
     password.assert_called_once()
     assert supervisor.call_args.args[1].student_id == "offline"

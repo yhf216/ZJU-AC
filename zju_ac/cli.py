@@ -41,7 +41,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--demo", action="store_true", help="离线演示提醒，无需登录")
     result.add_argument("--no-desktop", action="store_true", help="关闭桌面通知")
     result.add_argument("--no-bell", action="store_true", help="关闭终端提示音")
-    result.add_argument("--watchdog", action="store_true", help="启用独立进程看门狗")
+    result.add_argument(
+        "--watchdog",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="独立进程看门狗，默认开启；--no-watchdog 关闭",
+    )
     result.add_argument(
         "--restart-delay", type=positive_int, default=15, help="异常退出后等待秒数，默认 15"
     )
@@ -83,7 +88,7 @@ def run_application(
             student_id, password = credentials.student_id, credentials.password
         if not student_id or not password:
             raise ZjuError("学号和密码不能为空。")
-        if args.watchdog and not supervised:
+        if args.watchdog and not args.once and not supervised:
             return run_watchdog(args, Credentials(student_id, password))
         with login(student_id, password, args.login_timeout) as client:
             password = ""
