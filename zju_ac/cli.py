@@ -8,67 +8,38 @@ import traceback
 from pathlib import Path
 
 from . import __version__
+from .config import Settings, load_config
 from .errors import AuthenticationExpired, TemporaryError, ZjuError
 from .models import Rollcall
 from .notify import Notifier, configure_terminal
 from .watchdog import USER_ACTION_REQUIRED, Credentials, run_watchdog
 
 
-def seconds(value: str) -> int:
-    parsed = int(value)
-    if parsed < 5:
-        raise argparse.ArgumentTypeError("必须至少为 5 秒")
-    return parsed
-
-
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("必须为正整数")
-    return parsed
-
-
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="ZJU-AC：终端登录与课堂签到提醒")
+    result = argparse.ArgumentParser(description="ZJU-AC：运行参数统一读取根目录 config.toml")
     result.add_argument("--version", action="version", version=__version__)
-    result.add_argument("--interval", type=seconds, default=15, help="轮询间隔秒数，默认 15")
-    result.add_argument("--remind-every", type=seconds, default=0, help="未完成时重复提醒的秒数")
-    result.add_argument("--login-timeout", type=seconds, default=180, help="登录等待秒数，默认 180")
-    result.add_argument("--once", action="store_true", help="登录后查询一次并退出")
-    result.add_argument(
-        "--reminders-only", action="store_true", help="仅提醒，不询问或提交数字及 GPS 签到"
-    )
-    result.add_argument("--demo", action="store_true", help="离线演示提醒，无需登录")
-    result.add_argument("--no-desktop", action="store_true", help="关闭桌面通知")
-    result.add_argument("--no-bell", action="store_true", help="关闭终端提示音")
-    result.add_argument(
-        "--watchdog",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="独立进程看门狗，默认开启；--no-watchdog 关闭",
-    )
-    result.add_argument(
-        "--restart-delay", type=positive_int, default=15, help="异常退出后等待秒数，默认 15"
-    )
-    result.add_argument(
-        "--max-restarts", type=positive_int, default=5, help="10 分钟内最多重启次数，默认 5"
-    )
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     configure_terminal()
-    return run_application(parser().parse_args(argv))
+    parser().parse_args(argv)
+    try:
+        settings = load_config()
+    except ZjuError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return USER_ACTION_REQUIRED
+    return run_application(settings)
 
 
 def run_application(
-    args: argparse.Namespace,
+    args: Settings,
     credentials: Credentials | None = None,
     supervised: bool = False,
 ) -> int:
     configure_terminal()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
-    notifier = Notifier(desktop=not args.no_desktop, bell=not args.no_bell)
+    notifier = Notifier(desktop=args.desktop, bell=args.bell)
     if args.demo:
         notifier.send(Rollcall("demo", "演示课程", "这是一条离线测试提醒", "数字"))
         return 0
@@ -92,7 +63,11 @@ def run_application(
             return run_watchdog(args, Credentials(student_id, password))
         with login(student_id, password, args.login_timeout) as client:
             password = ""
-            checkin = None if args.reminders_only or args.once else ConfirmedCheckin(client)
+            checkin = (
+                None
+                if args.reminders_only or args.once
+                else ConfirmedCheckin(client, settings=args)
+            )
             try:
                 run_monitor(
                     client,

@@ -4,8 +4,17 @@ from unittest.mock import Mock
 
 import pytest
 
+from zju_ac import cli
 from zju_ac.auth import trusted_login_url
 from zju_ac.cli import main, parser
+from zju_ac.config import Settings
+
+
+@pytest.fixture(autouse=True)
+def configured_cli(monkeypatch):
+    monkeypatch.setattr(
+        cli, "load_config", lambda: Settings(watchdog=False, desktop=False, bell=False)
+    )
 
 
 @pytest.mark.parametrize(
@@ -38,7 +47,10 @@ def test_untrusted_auth_origins(url):
 def test_offline_demo_never_reads_credentials(monkeypatch, capsys):
     prompt = Mock(side_effect=AssertionError("Unexpected credential request"))
     monkeypatch.setattr("builtins.input", prompt)
-    assert main(["--demo", "--no-desktop", "--no-bell"]) == 0
+    monkeypatch.setattr(
+        cli, "load_config", lambda: Settings(mode="demo", desktop=False, bell=False)
+    )
+    assert main([]) == 0
     assert "签到提醒" in capsys.readouterr().out
 
 
@@ -70,7 +82,8 @@ def test_interactive_cli_uses_http_login_then_monitor(monkeypatch):
     monkeypatch.setattr(auth, "login", fake_login)
     run = Mock()
     monkeypatch.setattr(monitor, "run_monitor", run)
-    assert main(["--once", "--no-desktop", "--no-bell"]) == 0
+    monkeypatch.setattr(cli, "load_config", lambda: Settings(mode="once", watchdog=False))
+    assert main([]) == 0
     assert calls == [("student", "dummy-password", 180)]
     assert run.call_args.args[0] is client
     assert run.call_args.args[-1] is True
@@ -97,7 +110,7 @@ def test_missing_dependency_reported_before_credentials(monkeypatch, capsys, mod
     monkeypatch.setattr("builtins.input", prompt)
     monkeypatch.setattr("getpass.getpass", prompt)
     monkeypatch.setattr("builtins.__import__", missing_import)
-    assert main(["--no-desktop", "--no-bell"]) == 1
+    assert main([]) == 1
     prompt.assert_not_called()
     output = capsys.readouterr().err
     assert "python -m pip install -r requirements.txt" in output
@@ -117,15 +130,16 @@ def test_unexpected_failure_reports_location_without_private_message(monkeypatch
 
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.__import__", failed_import)
-    assert main(["--no-desktop", "--no-bell"]) == 1
+    assert main([]) == 1
     output = capsys.readouterr().err
     assert "RuntimeError" in output
     assert "test_auth_cli.py:" in output
     assert "private-password" not in output
 
 
-@pytest.mark.parametrize("options", [["--reminders-only"], ["--once"]])
-def test_read_only_modes_do_not_construct_submission_handler(monkeypatch, options):
+@pytest.mark.parametrize("mode", ["reminders", "once"])
+@pytest.mark.parametrize("automatic", [False, True])
+def test_read_only_modes_do_not_construct_submission_handler(monkeypatch, mode, automatic):
     from zju_ac import auth, checkin, monitor
 
     @contextmanager
@@ -140,6 +154,50 @@ def test_read_only_modes_do_not_construct_submission_handler(monkeypatch, option
     monkeypatch.setattr(checkin, "ConfirmedCheckin", handler)
     run = Mock()
     monkeypatch.setattr(monitor, "run_monitor", run)
-    assert main(["--no-watchdog", *options]) == 0
+    monkeypatch.setattr(
+        cli, "load_config", lambda: Settings(mode=mode, watchdog=False, auto_checkin=automatic)
+    )
+    assert main([]) == 0
     handler.assert_not_called()
     assert run.call_args.kwargs["checkin"] is None
+
+
+def test_cli_passes_automatic_config_to_monitor_without_confirmation_input(monkeypatch):
+    from zju_ac import auth, checkin
+    from zju_ac.models import Rollcall
+
+    record = Rollcall("42", "测试课程", "数字签到", "数字", course_id="7")
+    client = Mock()
+    finished = []
+
+    def rollcalls():
+        if finished:
+            raise KeyboardInterrupt
+        return [record]
+
+    client.rollcalls.side_effect = rollcalls
+    client.fresh_number.return_value = record
+    client.my_rollcall_status.return_value = "absent"
+    client.read_number_code.return_value = "0123"
+
+    def verify(record):
+        finished.append(True)
+        return True
+
+    client.verify_attendance.side_effect = verify
+
+    @contextmanager
+    def fake_login(*args):
+        yield client
+
+    configured = Settings(auto_checkin=True, watchdog=False, desktop=False, bell=False)
+    monkeypatch.setattr(cli, "load_config", lambda: configured)
+    monkeypatch.setattr(auth, "login", fake_login)
+    username = Mock(return_value="offline")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", username)
+    monkeypatch.setattr("getpass.getpass", lambda prompt: "dummy")
+    monkeypatch.setattr(checkin.ConfirmedCheckin, "wait", lambda self, seconds: None)
+    assert cli.main([]) == 0
+    username.assert_called_once_with("学号：")
+    client.submit_number.assert_called_once_with(record, "0123")

@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from zju_ac import cli, watchdog
+from zju_ac.config import Settings
 from zju_ac.errors import AuthenticationExpired, ProtocolError, TemporaryError, ZjuError
 
 
@@ -204,7 +205,7 @@ def test_supervised_exit_classification(monkeypatch, capsys, failure, code):
     monkeypatch.setattr(auth, "login", Mock(side_effect=failure))
     prompt = Mock(side_effect=AssertionError("Stored in-memory credentials should be reused"))
     monkeypatch.setattr("builtins.input", prompt)
-    args = cli.parser().parse_args(["--watchdog", "--once", "--no-desktop", "--no-bell"])
+    args = Settings(mode="once", desktop=False, bell=False)
     assert (
         cli.run_application(args, watchdog.Credentials("offline", "dummy"), supervised=True) == code
     )
@@ -212,19 +213,22 @@ def test_supervised_exit_classification(monkeypatch, capsys, failure, code):
     assert "private-password" not in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("options", [[], ["--watchdog"], ["--reminders-only"]])
-def test_cli_prompts_once_then_hands_credentials_to_supervisor(monkeypatch, options):
+@pytest.mark.parametrize("mode", ["monitor", "reminders"])
+def test_cli_prompts_once_then_hands_credentials_to_supervisor(monkeypatch, mode):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     username, password = Mock(return_value="offline"), Mock(return_value="dummy")
     monkeypatch.setattr("builtins.input", username)
     monkeypatch.setattr("getpass.getpass", password)
     supervisor = Mock(return_value=0)
     monkeypatch.setattr(cli, "run_watchdog", supervisor)
-    assert cli.main(options) == 0
+    configured = Settings(mode=mode)
+    monkeypatch.setattr(cli, "load_config", lambda: configured)
+    assert cli.main([]) == 0
     username.assert_called_once()
     password.assert_called_once()
     assert supervisor.call_args.args[1].student_id == "offline"
     assert supervisor.call_args.args[1].password == "dummy"
+    assert supervisor.call_args.args[0] is configured
 
 
 @pytest.mark.parametrize("option", ["--restart-delay", "--max-restarts"])

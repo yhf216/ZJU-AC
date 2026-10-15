@@ -1,13 +1,15 @@
-"""User-confirmed attendance; only the monitor thread performs HTTP requests."""
+"""Manual or configured automatic attendance; HTTP stays on the monitor thread."""
 
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from .client import CoursesClient, number_code
+from .config import Settings
 from .errors import AuthenticationExpired, SubmissionUncertain, ZjuError
-from .gps import PROBES, Coordinates, estimate_location
+from .gate import allows_auto_checkin
 from .models import SIGNED, Rollcall
 
 
@@ -29,8 +31,8 @@ class Prompt:
             return f"未能自动读取 {label} 的数字码。请输入课堂公布的码（回车取消）："
         if self.record.kind == "GPS":
             return (
-                f"{label} 的 GPS 签到：将通过距离响应推算签到点，最多发送 4 次定位请求，"
-                "探测也可能直接完成签到；不读取本机真实位置。确认尝试？[y/N]："
+                f"确认提交 {label} 的 GPS 签到？将使用 config.toml 选定地点的坐标，"
+                "只提交一次，不读取本机真实位置。[y/N]："
             )
         return f"确认提交 {label} 的数字签到？[y/N]："
 
@@ -83,9 +85,17 @@ class TerminalPrompts:
 
 
 class ConfirmedCheckin:
-    def __init__(self, client: CoursesClient, prompts: TerminalPrompts | None = None):
+    def __init__(
+        self,
+        client: CoursesClient,
+        prompts: TerminalPrompts | None = None,
+        *,
+        settings: Settings | None = None,
+    ):
         self.client = client
+        self.settings = settings if settings is not None else Settings()
         self.prompts = prompts if prompts is not None else TerminalPrompts()
+        self.automatic: deque[Rollcall] = deque()
         self.asked: set[str] = set()
         self.pending: dict[str, Prompt] = {}
         self.closed = False
@@ -95,8 +105,20 @@ class ConfirmedCheckin:
             return
         for record in records:
             if record.kind in {"数字", "GPS"} and record.id not in self.asked:
+                if self.settings.auto_checkin and not allows_auto_checkin(
+                    record, self.settings.gate
+                ):
+                    continue
                 self.asked.add(record.id)
-                self._ask(Prompt(record))
+                if record.kind == "GPS":
+                    if self.settings.gps is None:
+                        print("未配置 GPS 地点，本活动仅提醒，请检查 config.toml。", flush=True)
+                        continue
+                    print(f"GPS 将使用地点：{display(self.settings.gps.name)}。", flush=True)
+                if self.settings.auto_checkin:
+                    self.automatic.append(record)
+                else:
+                    self._ask(Prompt(record))
 
     def _ask(self, prompt: Prompt) -> None:
         self.pending[prompt.record.id] = prompt
@@ -105,6 +127,10 @@ class ConfirmedCheckin:
     def process(self) -> None:
         if self.closed:
             return
+        while self.automatic:
+            record = self.automatic.popleft()
+            print(f"自动处理{record.kind}签到（编号 {display(record.id)}）。", flush=True)
+            self._submit(record)
         for answer in self.prompts.poll():
             prompt = answer.prompt
             if self.pending.get(prompt.record.id) != prompt:
@@ -127,15 +153,18 @@ class ConfirmedCheckin:
                 if code is None:
                     print("数字码为空或格式无效，已取消本次提交。", flush=True)
                     continue
-            try:
-                if prompt.record.kind == "GPS":
-                    self._submit_gps(prompt.record)
-                else:
-                    self._submit_number(prompt.record, code)
-            except AuthenticationExpired:
-                raise
-            except ZjuError as exc:
-                print(f"{prompt.record.kind}签到未完成：{exc}", flush=True)
+            self._submit(prompt.record, code)
+
+    def _submit(self, record: Rollcall, code: str | None = None) -> None:
+        try:
+            if record.kind == "GPS":
+                self._submit_gps(record)
+            else:
+                self._submit_number(record, code)
+        except AuthenticationExpired:
+            raise
+        except ZjuError as exc:
+            print(f"{record.kind}签到未完成：{exc}", flush=True)
 
     def _submit_number(self, record: Rollcall, code: str | None) -> None:
         fresh = self.client.fresh_number(record)
@@ -152,7 +181,10 @@ class ConfirmedCheckin:
         if code is None:
             code = self.client.read_number_code(fresh)
             if code is None:
-                self._ask(Prompt(fresh, "code"))
+                if self.settings.auto_checkin:
+                    print("自动取不到数字码，本次仅提醒，不提交或猜测数字码。", flush=True)
+                else:
+                    self._ask(Prompt(fresh, "code"))
                 return
         # Code lookup or manual input can take time; check activity again just before PUT.
         if self.client.fresh_number(fresh) is None:
@@ -165,41 +197,26 @@ class ConfirmedCheckin:
         self._verify(fresh)
 
     def _submit_gps(self, record: Rollcall) -> None:
-        distances = []
-        for index, coordinates in enumerate(PROBES, start=1):
-            distance = self._gps_attempt(record, coordinates)
-            if distance is None:
-                return
-            distances.append(distance)
-            print(f"GPS 探测 {index}/3 返回范围外距离，继续校验。", flush=True)
-        location = estimate_location(distances)
-        print("GPS 距离一致性检查通过，尝试提交计算位置。", flush=True)
-        if self._gps_attempt(record, location) is not None:
-            print("GPS 签到未完成：计算位置仍被判为范围外，已停止本次尝试。", flush=True)
-
-    def _gps_attempt(self, record: Rollcall, coordinates: Coordinates) -> float | None:
-        # Probes are writes too: refresh and check own status before every position.
+        location = self.settings.gps
+        if location is None:
+            print("未配置 GPS 地点，已取消提交。", flush=True)
+            return
         fresh = self.client.fresh_gps(record)
         if fresh is None:
             print("GPS 活动已结束、已完成或类型已变化，已取消后续定位请求。", flush=True)
-            return None
+            return
         status = self.client.my_rollcall_status(fresh)
         if status in SIGNED:
             print("本人已签到，无需继续定位请求。", flush=True)
-            return None
+            return
         if status != "absent":
             print("本人状态不是明确的待签到状态，已取消后续定位请求。", flush=True)
-            return None
+            return
         try:
-            distance = self.client.submit_gps(fresh, coordinates)
+            self.client.submit_gps(fresh, location.coordinates, accuracy=location.accuracy)
         except SubmissionUncertain as exc:
             print(str(exc), flush=True)
-            self._verify(fresh)
-            return None
-        if distance is None:
-            # HTTP 200 or an unrecognized success shape cannot authorize more writes.
-            self._verify(fresh)
-        return distance
+        self._verify(fresh)
 
     def _verify(self, fresh: Rollcall) -> None:
         try:
@@ -230,4 +247,5 @@ class ConfirmedCheckin:
     def close(self) -> None:
         self.closed = True
         self.pending.clear()
+        self.automatic.clear()
         self.prompts.close()

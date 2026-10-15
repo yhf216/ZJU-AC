@@ -5,6 +5,7 @@ import requests
 
 from zju_ac.checkin import Answer, ConfirmedCheckin, Prompt
 from zju_ac.client import BASE_URL, CoursesClient
+from zju_ac.config import GpsSettings, Settings
 from zju_ac.errors import (
     AuthenticationExpired,
     CheckinRejected,
@@ -12,7 +13,7 @@ from zju_ac.errors import (
     ProtocolError,
     SubmissionUncertain,
 )
-from zju_ac.gps import Coordinates, distance_metres
+from zju_ac.gps import Coordinates
 from zju_ac.models import Rollcall
 
 RECORD = Rollcall("42", "测试课程", "签到", "GPS", course_id="7")
@@ -53,12 +54,14 @@ def test_gps_payload_uses_stable_device_without_redirect_or_proxy():
 
 
 @pytest.mark.parametrize("status", [200, 400])
-@pytest.mark.parametrize("field", ["top", "data", "result"])
-def test_only_explicit_outside_scope_rejection_supplies_distance(status, field):
+@pytest.mark.parametrize("distance", [None, 123.5])
+def test_outside_scope_rejection_stops_with_or_without_distance(status, distance):
     payload = {"error_code": "radar_out_of_scope"}
-    payload.update({"distance": 123.5} if field == "top" else {field: {"distance": 123.5}})
+    if distance is not None:
+        payload["distance"] = distance
     client, _, response = gps_client(payload, status)
-    assert client.submit_gps(RECORD, LOCATION) == 123.5
+    with pytest.raises(CheckinRejected, match="config.toml"):
+        client.submit_gps(RECORD, LOCATION)
     response.close.assert_called_once()
 
 
@@ -78,7 +81,7 @@ def test_http_200_without_rejection_requires_own_status_verification(payload):
 @pytest.mark.parametrize("value", [None, "123", True, 0, -1, float("nan"), float("inf")])
 def test_invalid_distance_does_not_allow_another_position(value):
     client, _, _ = gps_client({"error_code": "radar_out_of_scope", "distance": value}, 400)
-    with pytest.raises(ProtocolError):
+    with pytest.raises(CheckinRejected):
         client.submit_gps(RECORD, LOCATION)
 
 
@@ -91,7 +94,7 @@ def test_invalid_distance_does_not_allow_another_position(value):
 )
 def test_missing_or_ambiguous_distances_stop(payload):
     client, _, _ = gps_client(payload, 400)
-    with pytest.raises(ProtocolError):
+    with pytest.raises(CheckinRejected):
         client.submit_gps(RECORD, LOCATION)
 
 
@@ -138,7 +141,8 @@ def test_gps_freshness_checks_course_type_and_activity():
     assert client.fresh_gps(RECORD) is None
 
 
-def test_full_confirmed_workflow_with_real_client_and_simulated_http_backend(capsys):
+@pytest.mark.parametrize("automatic", [False, True])
+def test_full_workflow_with_real_client_and_simulated_http_backend(capsys, automatic):
     session = Mock()
     state = {"status": "absent"}
 
@@ -172,10 +176,8 @@ def test_full_confirmed_workflow_with_real_client_and_simulated_http_backend(cap
     def put(url, **options):
         assert url == BASE_URL + "/api/rollcall/42/answer"
         payload = options["json"]
-        position = Coordinates(payload["latitude"], payload["longitude"])
-        distance = distance_metres(position, LOCATION, 6371000.0)
-        if distance > 5:
-            return response({"error_code": "radar_out_of_scope", "distance": round(distance)}, 400)
+        assert payload["latitude"] == LOCATION.latitude
+        assert payload["longitude"] == LOCATION.longitude
         state["status"] = "on_call_fine"
         return response({"status_name": "on_call_fine"})
 
@@ -184,15 +186,34 @@ def test_full_confirmed_workflow_with_real_client_and_simulated_http_backend(cap
     client = CoursesClient(session)
     prompts = Mock()
     prompts.poll.return_value = []
-    checkin = ConfirmedCheckin(client, prompts)
+    checkin = ConfirmedCheckin(
+        client,
+        prompts,
+        settings=Settings(auto_checkin=automatic, gps=GpsSettings("test", "测试地点", LOCATION)),
+    )
     checkin.observe(client.rollcalls())
+    if not automatic:
+        checkin.process()
+        session.put.assert_not_called()
+        prompts.poll.return_value = [Answer(Prompt(RECORD), "y")]
     checkin.process()
-    session.put.assert_not_called()
-    prompts.poll.return_value = [Answer(Prompt(RECORD), "y")]
-    checkin.process()
-    assert session.put.call_count == 4
+    assert session.put.call_count == 1
     assert state["status"] == "on_call_fine"
     assert "[签到成功]" in capsys.readouterr().out
     assert {call.kwargs["json"]["deviceId"] for call in session.put.call_args_list} == {
         client.device_id
     }
+
+
+def test_configured_accuracy_is_submitted():
+    client, session, _ = gps_client({"status": "on_call_fine"})
+    client.submit_gps(RECORD, LOCATION, accuracy=68.0)
+    assert session.put.call_args.kwargs["json"]["accuracy"] == 68.0
+
+
+@pytest.mark.parametrize("accuracy", [True, "35", 0, -1, float("nan"), float("inf")])
+def test_invalid_accuracy_never_writes(accuracy):
+    client, session, _ = gps_client({})
+    with pytest.raises(ProtocolError):
+        client.submit_gps(RECORD, LOCATION, accuracy=accuracy)
+    session.put.assert_not_called()
