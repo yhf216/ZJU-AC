@@ -8,15 +8,23 @@ import traceback
 from pathlib import Path
 
 from . import __version__
-from .errors import ZjuError
+from .errors import AuthenticationExpired, TemporaryError, ZjuError
 from .models import Rollcall
 from .notify import Notifier, configure_terminal
+from .watchdog import USER_ACTION_REQUIRED, Credentials, run_watchdog
 
 
 def seconds(value: str) -> int:
     parsed = int(value)
     if parsed < 5:
         raise argparse.ArgumentTypeError("必须至少为 5 秒")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("必须为正整数")
     return parsed
 
 
@@ -33,18 +41,33 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--demo", action="store_true", help="离线演示提醒，无需登录")
     result.add_argument("--no-desktop", action="store_true", help="关闭桌面通知")
     result.add_argument("--no-bell", action="store_true", help="关闭终端提示音")
+    result.add_argument("--watchdog", action="store_true", help="启用独立进程看门狗")
+    result.add_argument(
+        "--restart-delay", type=positive_int, default=15, help="异常退出后等待秒数，默认 15"
+    )
+    result.add_argument(
+        "--max-restarts", type=positive_int, default=5, help="10 分钟内最多重启次数，默认 5"
+    )
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     configure_terminal()
-    args = parser().parse_args(argv)
+    return run_application(parser().parse_args(argv))
+
+
+def run_application(
+    args: argparse.Namespace,
+    credentials: Credentials | None = None,
+    supervised: bool = False,
+) -> int:
+    configure_terminal()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     notifier = Notifier(desktop=not args.no_desktop, bell=not args.no_bell)
     if args.demo:
         notifier.send(Rollcall("demo", "演示课程", "这是一条离线测试提醒", "数字"))
         return 0
-    if not sys.stdin.isatty():
+    if credentials is None and not sys.stdin.isatty():
         print("请在交互终端运行，以便安全输入学号和密码。", file=sys.stderr)
         return 2
     try:
@@ -53,10 +76,15 @@ def main(argv: list[str] | None = None) -> int:
         from .checkin import NumericCheckin
         from .monitor import run_monitor
 
-        student_id = input("学号：").strip()
-        password = getpass.getpass("统一身份认证密码（隐藏输入）：")
+        if credentials is None:
+            student_id = input("学号：").strip()
+            password = getpass.getpass("统一身份认证密码（隐藏输入）：")
+        else:
+            student_id, password = credentials.student_id, credentials.password
         if not student_id or not password:
             raise ZjuError("学号和密码不能为空。")
+        if args.watchdog and not supervised:
+            return run_watchdog(args, Credentials(student_id, password))
         with login(student_id, password, args.login_timeout) as client:
             password = ""
             checkin = None if args.reminders_only or args.once else NumericCheckin(client)
@@ -76,9 +104,12 @@ def main(argv: list[str] | None = None) -> int:
     except (KeyboardInterrupt, EOFError):
         print("\n已退出。")
         return 0
-    except ZjuError as exc:
+    except (AuthenticationExpired, TemporaryError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
+    except ZjuError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return USER_ACTION_REQUIRED if supervised else 1
     except ModuleNotFoundError as exc:
         package = {"requests": "requests", "bs4": "beautifulsoup4"}.get(exc.name)
         missing = f"缺少运行依赖 {package}" if package else "运行依赖安装不完整"
@@ -88,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
             f"当前 Python：{sys.executable}",
             file=sys.stderr,
         )
-        return 1
+        return USER_ACTION_REQUIRED if supervised else 1
     except Exception as exc:
         # Report a code location, never exception arguments, credentials, or ticket URLs.
         frame = traceback.extract_tb(exc.__traceback__)[-1]
