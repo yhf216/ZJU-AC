@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup, Tag
 from . import __version__
 from .client import BASE_URL, CoursesClient
 from .errors import AuthenticationExpired, ProtocolError, TemporaryError, ZjuError
+from .network import configure_direct_session, create_direct_session
 
 AUTH_HOSTS = {"courses.zju.edu.cn", "identity.zju.edu.cn", "zjuam.zju.edu.cn"}
 REDIRECTS = {301, 302, 303, 307, 308}
@@ -62,7 +63,7 @@ def form_values(form: Tag) -> dict[str, str]:
 
 class HttpAuthenticator:
     def __init__(self, session: requests.Session, timeout: float):
-        self.session = session
+        self.session = configure_direct_session(session)
         self.deadline = time.monotonic() + timeout
 
     def request(self, method: str, url: str, **kwargs) -> requests.Response:
@@ -79,7 +80,7 @@ class HttpAuthenticator:
                 **kwargs,
             )
         except requests.RequestException as exc:
-            raise TemporaryError("认证请求失败，请检查网络、代理或校园网连接。") from exc
+            raise TemporaryError("认证直连请求失败，请检查网络或校园网连接。") from exc
         if response.status_code >= 400:
             status = response.status_code
             response.close()
@@ -204,7 +205,7 @@ class HttpAuthenticator:
 
 @contextmanager
 def login(student_id: str, password: str, login_timeout: int = 180):
-    session = requests.Session()
+    session = create_direct_session()
     session.headers.update(
         {
             "User-Agent": f"ZJU-AC/{__version__}",
@@ -212,7 +213,7 @@ def login(student_id: str, password: str, login_timeout: int = 180):
         }
     )
     try:
-        print("正在通过 HTTPS 登录统一身份认证……", flush=True)
+        print("正在通过 HTTPS 直连登录统一身份认证（忽略环境及系统代理）……", flush=True)
         HttpAuthenticator(session, login_timeout).authenticate(student_id, password)
         password = ""
         print("登录成功，开始监控签到。Ctrl+C 退出。", flush=True)

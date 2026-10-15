@@ -1,5 +1,6 @@
 """Authenticated course queries and explicit numeric attendance submissions."""
 
+import logging
 import re
 import time
 import uuid
@@ -17,8 +18,10 @@ from .errors import (
     TemporaryError,
 )
 from .models import SIGNED, Rollcall, active_rollcalls
+from .network import configure_direct_session
 
 BASE_URL = "https://courses.zju.edu.cn"
+LOGGER = logging.getLogger(__name__)
 
 
 def api_id(value: str | None) -> str:
@@ -37,7 +40,7 @@ def number_code(value: Any) -> str | None:
 
 class CoursesClient:
     def __init__(self, session: requests.Session, timeout: float = 15):
-        self.session = session
+        self.session = configure_direct_session(session)
         self.timeout = timeout
         self.device_id = str(uuid.uuid4())
         self._student_id: str | None = None
@@ -63,7 +66,7 @@ class CoursesClient:
                 **options,
             )
         except requests.RequestException as exc:
-            raise TemporaryError("请求失败，请检查网络、代理或校园网连接。") from exc
+            raise TemporaryError("直连请求失败，请检查网络或校园网连接。") from exc
         return self._read_response(response)
 
     @staticmethod
@@ -133,9 +136,10 @@ class CoursesClient:
         try:
             detail = self.get_json(f"/api/rollcall/{rid}/student_rollcalls")
             if isinstance(detail, dict) and (code := number_code(detail.get("number_code"))):
+                LOGGER.info("数字码已从点名详情通道获取（活动 %s）。", rid)
                 return code
-        except (PermissionDenied, ProtocolError):
-            pass
+        except (PermissionDenied, ProtocolError, TemporaryError):
+            LOGGER.warning("点名详情取码通道不可用，尝试课表日期通道（活动 %s）。", rid)
         if record.course_id is None or record.started_at is None:
             return None
         try:
@@ -146,14 +150,18 @@ class CoursesClient:
                     "rollcall_date": record.started_at.astimezone(UTC).date().isoformat(),
                 },
             )
-        except (PermissionDenied, ProtocolError):
+        except (PermissionDenied, ProtocolError, TemporaryError):
+            LOGGER.warning("课表日期取码通道不可用，将提示手动输入（活动 %s）。", rid)
             return None
         items = payload.get("rollcalls", []) if isinstance(payload, dict) else []
         if not isinstance(items, list):
             return None
         for item in items:
             if isinstance(item, dict) and str(item.get("id")) == rid:
-                return number_code(item.get("number_code"))
+                code = number_code(item.get("number_code"))
+                if code is not None:
+                    LOGGER.info("数字码已从课表日期通道获取（活动 %s）。", rid)
+                return code
         return None
 
     def my_rollcall_status(self, record: Rollcall) -> str | None:

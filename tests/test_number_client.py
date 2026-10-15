@@ -5,7 +5,7 @@ import pytest
 import requests
 
 from zju_ac.client import BASE_URL, CoursesClient, number_code
-from zju_ac.errors import CheckinRejected, ProtocolError, SubmissionUncertain
+from zju_ac.errors import AuthenticationExpired, CheckinRejected, ProtocolError, SubmissionUncertain
 from zju_ac.models import Rollcall
 
 RECORD = Rollcall(
@@ -175,3 +175,75 @@ def test_freshness_check_rejects_type_or_course_changes():
     client = CoursesClient(Mock())
     client.rollcalls = Mock(return_value=[Rollcall("42", "课程", "签到", "GPS", course_id="7")])
     assert client.fresh_number(RECORD) is None
+
+
+@pytest.mark.parametrize(
+    "failure", [requests.Timeout("offline"), requests.ConnectionError("offline")]
+)
+def test_detail_network_failure_falls_back_to_timetable(failure):
+    session = Mock()
+    session.get.side_effect = [
+        failure,
+        json_response(
+            {
+                "rollcalls": [{"id": 42, "number_code": "0123"}],
+            }
+        ),
+    ]
+    assert CoursesClient(session).read_number_code(RECORD) == "0123"
+    assert session.get.call_count == 2
+    assert session.get.call_args.args == (BASE_URL + "/api/timetable_rollcalls",)
+
+
+def test_detail_server_error_falls_back_to_timetable():
+    session = Mock()
+    session.get.side_effect = [
+        json_response({}, 500),
+        json_response(
+            {
+                "rollcalls": [{"id": 42, "number_code": "0123"}],
+            }
+        ),
+    ]
+    assert CoursesClient(session).read_number_code(RECORD) == "0123"
+
+
+def test_both_channels_temporarily_unavailable_allow_manual_input():
+    session = Mock()
+    session.get.side_effect = [
+        requests.Timeout("private-ticket"),
+        requests.Timeout("private-ticket"),
+    ]
+    assert CoursesClient(session).read_number_code(RECORD) is None
+    assert session.get.call_count == 2
+    session.put.assert_not_called()
+
+
+def test_expired_session_does_not_fall_back_or_prompt_for_code():
+    session = Mock()
+    session.get.return_value = json_response({}, 401)
+    with pytest.raises(AuthenticationExpired):
+        CoursesClient(session).read_number_code(RECORD)
+    session.get.assert_called_once()
+
+
+def test_missing_detail_code_falls_back_but_wrong_activity_never_supplies_code():
+    session = Mock()
+    session.get.side_effect = [
+        json_response({"number_code": None}),
+        json_response(
+            {
+                "rollcalls": [{"id": 41, "number_code": "0123"}],
+            }
+        ),
+    ]
+    assert CoursesClient(session).read_number_code(RECORD) is None
+
+
+def test_channel_logging_never_prints_the_code(caplog):
+    session = Mock()
+    session.get.return_value = json_response({"number_code": "0123"})
+    with caplog.at_level("INFO", logger="zju_ac.client"):
+        assert CoursesClient(session).read_number_code(RECORD) == "0123"
+    assert "点名详情通道" in caplog.text
+    assert "0123" not in caplog.text
