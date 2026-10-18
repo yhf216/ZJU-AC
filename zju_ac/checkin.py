@@ -100,11 +100,15 @@ class ConfirmedCheckin:
         *,
         settings: Settings | None = None,
         notifier: Notifier | None = None,
+        stop_event=None,
+        on_status=None,
     ):
         self.client = client
         self.settings = settings if settings is not None else Settings()
         self.prompts = prompts if prompts is not None else TerminalPrompts()
         self.notifier = notifier if notifier is not None else Notifier(desktop=False, bell=False)
+        self.stop_event = stop_event
+        self.on_status = on_status
         self.automatic: dict[str, WaitingActivity] = {}
         self.code_retries: dict[str, CodeRetry] = {}
         self.code_reads: dict[str, int] = {}
@@ -148,6 +152,7 @@ class ConfirmedCheckin:
                 self.asked.add(record.id)
                 if record.kind == "GPS":
                     if self.settings.gps is None:
+                        self._status(record, "reminder", "未选择地点，请手动处理")
                         print("未配置 GPS 地点，本活动仅提醒，请检查 config.toml。", flush=True)
                         continue
                     print(f"GPS 将使用地点：{display(self.settings.gps.name)}。", flush=True)
@@ -157,10 +162,19 @@ class ConfirmedCheckin:
                     self._ask(Prompt(record))
 
     def _ask(self, prompt: Prompt) -> None:
+        self._status(
+            prompt.record, "confirm", "等待确认" if prompt.stage == "confirm" else "等待补码"
+        )
         self.pending[prompt.record.id] = prompt
         self.prompts.ask(prompt)
 
+    def _status(self, record: Rollcall, stage: str, message: str) -> None:
+        if self.on_status is not None:
+            self.on_status(record, stage, message)
+
     def process(self) -> None:
+        if self.stop_event is not None and self.stop_event.is_set():
+            return
         if self.closed:
             return
         self._process_automatic()
@@ -176,6 +190,7 @@ class ConfirmedCheckin:
                 return
             if prompt.stage == "confirm":
                 if answer.value.lower() not in {"y", "yes"}:
+                    self._status(prompt.record, "skipped", "已跳过")
                     print(
                         f"已跳过{prompt.record.kind}签到（编号 {display(prompt.record.id)}）。",
                         flush=True,
@@ -185,6 +200,7 @@ class ConfirmedCheckin:
             else:
                 code = number_code(answer.value)
                 if code is None:
+                    self._status(prompt.record, "skipped", "已取消")
                     print("数字码为空或格式无效，已取消本次提交。", flush=True)
                     continue
             self._submit(prompt.record, code)
@@ -206,6 +222,7 @@ class ConfirmedCheckin:
                     activity, policy, self.settings.gate, progress, now, now_utc
                 )
             print(f"[门控] 活动 {display(rid)}：{decision.reason}。", flush=True)
+            self._status(activity.record, "waiting", decision.reason)
             if decision.action == "wait":
                 activity.next_check_at = now + policy.poll_interval_seconds
                 continue
@@ -217,6 +234,9 @@ class ConfirmedCheckin:
                 self._result(activity.record, "failure")
 
     def _submit(self, record: Rollcall, code: str | None = None) -> None:
+        if self.stop_event is not None and self.stop_event.is_set():
+            return
+        self._status(record, "checking", "正在核对活动状态")
         try:
             if record.kind == "GPS":
                 self._submit_gps(record)
@@ -234,6 +254,11 @@ class ConfirmedCheckin:
     def _result(self, record: Rollcall, outcome: str) -> None:
         if record.id not in self.results:
             self.results.add(record.id)
+            self._status(
+                record,
+                outcome,
+                {"success": "已确认成功", "failure": "未完成", "pending": "待核验"}[outcome],
+            )
             diagnostic("result", activity=record.id, outcome=outcome)
             self.notifier.result(record, outcome)
 
@@ -259,6 +284,7 @@ class ConfirmedCheckin:
             self.code_retries[record.id] = CodeRetry(
                 record, time.monotonic() + policy.interval_seconds
             )
+            self._status(record, "code_wait", f"等待取码 · {attempts}/{policy.max_attempts} 轮")
             diagnostic(
                 "code_retry", activity=record.id, attempt=attempts, delay=policy.interval_seconds
             )
@@ -309,6 +335,9 @@ class ConfirmedCheckin:
             print("提交前活动已结束或已完成，已取消提交。", flush=True)
             return
         try:
+            if self.stop_event is not None and self.stop_event.is_set():
+                return
+            self._status(fresh, "submitting", "正在提交")
             diagnostic("submit_started", activity=fresh.id, channel="number")
             self.client.submit_number(fresh, code)
         except SubmissionUncertain as exc:
@@ -335,6 +364,9 @@ class ConfirmedCheckin:
             self._result(fresh, "failure")
             return
         try:
+            if self.stop_event is not None and self.stop_event.is_set():
+                return
+            self._status(fresh, "submitting", "正在提交")
             diagnostic("submit_started", activity=fresh.id, channel="gps")
             self.client.submit_gps(fresh, location.coordinates, accuracy=location.accuracy)
         except SubmissionUncertain as exc:
@@ -369,10 +401,15 @@ class ConfirmedCheckin:
         """Process decisions promptly between polls without sharing the HTTP session."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            if self.stop_event is not None and self.stop_event.is_set():
+                return
             self.process()
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                time.sleep(min(1, remaining))
+                if self.stop_event is not None:
+                    self.stop_event.wait(min(1, remaining))
+                else:
+                    time.sleep(min(1, remaining))
 
     def close(self) -> None:
         self.closed = True

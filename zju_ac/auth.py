@@ -62,9 +62,10 @@ def form_values(form: Tag) -> dict[str, str]:
 
 
 class HttpAuthenticator:
-    def __init__(self, session: requests.Session, timeout: float):
+    def __init__(self, session: requests.Session, timeout: float, otp_reader=None):
         self.session = configure_direct_session(session)
         self.deadline = time.monotonic() + timeout
+        self.otp_reader = otp_reader
 
     def request(self, method: str, url: str, **kwargs) -> requests.Response:
         checked_url(url, url)
@@ -179,7 +180,8 @@ class HttpAuthenticator:
                         if str(otp_form.get("method", "get")).lower() != "post":
                             raise ProtocolError("二次验证表单不是 POST，已停止。")
                         field = otp_form.select_one('input[name="otp"], input[name="totp"]')
-                        code = input("请输入统一认证动态验证码：").strip()
+                        reader = self.otp_reader if self.otp_reader is not None else input
+                        code = reader("请输入统一认证动态验证码：").strip()
                         if not code or not code.isascii() or not code.isdigit():
                             raise ZjuError("动态验证码必须是数字。")
                         data = form_values(otp_form)
@@ -204,7 +206,7 @@ class HttpAuthenticator:
 
 
 @contextmanager
-def login(student_id: str, password: str, login_timeout: int = 180):
+def login(student_id: str, password: str, login_timeout: int = 180, *, otp_reader=None):
     session = create_direct_session()
     session.headers.update(
         {
@@ -214,9 +216,16 @@ def login(student_id: str, password: str, login_timeout: int = 180):
     )
     try:
         print("正在通过 HTTPS 直连登录统一身份认证（忽略环境及系统代理）……", flush=True)
-        HttpAuthenticator(session, login_timeout).authenticate(student_id, password)
+        if otp_reader is None:
+            authenticator = HttpAuthenticator(session, login_timeout)
+        else:
+            authenticator = HttpAuthenticator(session, login_timeout, otp_reader)
+        authenticator.authenticate(student_id, password)
         password = ""
-        print("登录成功，开始监控签到。Ctrl+C 退出。", flush=True)
+        print(
+            "登录成功，开始监控签到。Ctrl+C 退出。" if otp_reader is None else "登录成功。",
+            flush=True,
+        )
         yield CoursesClient(session)
     finally:
         session.cookies.clear()

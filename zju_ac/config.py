@@ -126,6 +126,10 @@ def load_config(path: Path | None = None) -> Settings:
         data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise ZjuError("无法读取 config.toml，请检查根目录文件及 UTF-8 TOML 格式。") from exc
+    return parse_config(data)
+
+
+def parse_config(data: dict) -> Settings:
     if data.keys() - {"runtime", "checkin", "notifications", "watchdog", "gps"}:
         raise ZjuError("config.toml 存在未知配置节，请对照项目示例。")
     runtime = _table(data, "runtime", {"mode", "interval", "remind_every", "login_timeout"})

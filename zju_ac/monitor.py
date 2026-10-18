@@ -37,10 +37,15 @@ def run_monitor(
     repeat_after: float = 0,
     once: bool = False,
     checkin: ConfirmedCheckin | None = None,
+    stop_event=None,
+    on_poll=None,
+    on_failure=None,
 ) -> None:
     tracker = ReminderTracker(repeat_after)
     failures = 0
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return
         started = time.monotonic()
         try:
             records = client.rollcalls()
@@ -50,14 +55,20 @@ def run_monitor(
                 raise
             failures += 1
             delay = min(300, interval * 2 ** min(failures, 5))
+            if on_failure is not None:
+                on_failure(delay)
             LOGGER.warning("%s %.0f 秒后重试。", exc, delay)
             if checkin is None:
-                time.sleep(delay)
+                stop_event.wait(delay) if stop_event is not None else time.sleep(delay)
             else:
                 checkin.wait(delay)
             continue
         failures = 0
         diagnostic("poll_ok", count=len(records))
+        if stop_event is not None and stop_event.is_set():
+            return
+        if on_poll is not None:
+            on_poll(records)
         LOGGER.info("监控正常：当前有 %d 项待签到。", len(records))
         for record in records:
             if tracker.due(record, started):
@@ -70,6 +81,6 @@ def run_monitor(
             return
         delay = max(0, interval - (time.monotonic() - started))
         if checkin is None:
-            time.sleep(delay)
+            stop_event.wait(delay) if stop_event is not None else time.sleep(delay)
         else:
             checkin.wait(delay)

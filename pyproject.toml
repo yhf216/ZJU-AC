@@ -4,14 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zju-ac"
-version = "0.8.0"
+version = "0.9.0"
 description = "Terminal login and attendance reminders for Learning at ZJU"
-readme = "README.md"
 requires-python = ">=3.12"
 dynamic = ["dependencies"]
 
 [project.scripts]
 zju-ac = "zju_ac.cli:main"
+
+[project.gui-scripts]
+zju-ac-desktop = "zju_ac.desktop.app:main"
+
+[tool.setuptools.package-data]
+"zju_ac.desktop" = ["qml/*.qml", "assets/*.svg"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
