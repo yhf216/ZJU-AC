@@ -12,6 +12,13 @@ from PySide6.QtGui import QDesktopServices
 from .. import __version__
 from ..diagnostics import export_bundle, record, setup
 from ..errors import ZjuError
+from .credentials import (
+    CredentialError,
+    CredentialVault,
+    SessionClock,
+    open_credentials,
+    seal_credentials,
+)
 from .storage import ConfigStore
 from .worker import worker_entry
 
@@ -31,27 +38,39 @@ class DesktopBridge(QObject):
         self.store = store
         setup(store.directory / "logs")
         self.context = multiprocessing.get_context("spawn")
-        self.process = self.connection = self.stop_event = None
+        self.process = self.connection = self.stop_event = self.pause_event = None
         self._credentials = None
         self._status, self._message = "准备就绪", ""
         self._connected = self._stopping = self._quitting = False
+        self._paused = self._pause_pending = self._logged_in = False
         self._restart_at = 0
         self._stop_deadline = 0
         self._restarts = deque()
-        self._started = 0
+        self._clock = SessionClock(lambda: time.monotonic())
         self._last_poll = "—"
         self._polls = 0
         self._success = set()
         self._activities = {}
         self._events = []
         self._prompts = []
-        self._dark = False
+        self._dark = True
+        self.vault = CredentialVault(store.directory)
+        self._saved_account = ""
+        self._has_saved_password = self._remember = False
+        self._remember_requested = False
+        try:
+            saved = self.vault.load()
+            if saved is not None:
+                self._saved_account = saved[0]
+                self._has_saved_password = self._remember = True
+            saved = None
+        except (OSError, ZjuError):
+            self._message = "已保存的登录信息无法读取，请清除后重新输入。"
         self.tray_available = False
         try:
-            self._dark = (
-                json.loads((store.directory / "appearance.json").read_text("utf-8")).get("dark")
-                is True
-            )
+            appearance = json.loads((store.directory / "appearance.json").read_text("utf-8"))
+            if appearance.get("schema") == 2 and type(appearance.get("dark")) is bool:
+                self._dark = appearance["dark"]
         except (OSError, ValueError, AttributeError):
             pass
         self.timer = QTimer(self)
@@ -62,18 +81,30 @@ class DesktopBridge(QObject):
 
     @Property("QVariantMap", notify=changed)
     def state(self):
-        elapsed = max(0, int(time.monotonic() - self._started)) if self._started else 0
         return {
             "running": self.process is not None or bool(self._restart_at),
             "connected": self._connected,
             "stopping": self._stopping,
+            "paused": self._paused,
+            "pausePending": self._pause_pending,
+            "authenticated": self._logged_in,
+            "canEdit": not self._stopping
+            and (
+                self.process is None
+                and not self._restart_at
+                or self._paused
+                and not self._pause_pending
+            ),
             "status": self._status,
             "message": self._message,
             "dark": self._dark,
             "lastPoll": self._last_poll,
             "polls": self._polls,
             "success": len(self._success),
-            "uptime": f"{elapsed // 3600:02}:{elapsed // 60 % 60:02}:{elapsed % 60:02}",
+            "uptime": self._clock.text,
+            "remember": self._remember,
+            "savedAccount": self._saved_account,
+            "hasSavedPassword": self._has_saved_password,
             "version": __version__,
             "date": datetime.now().strftime("%Y / %m / %d"),
         }
@@ -107,21 +138,42 @@ class DesktopBridge(QObject):
         self.eventsChanged.emit()
 
     @Slot(str, str)
-    def startMonitor(self, student: str, password: str):
+    @Slot(str, str, bool)
+    def startMonitor(self, student: str, password: str, remember: bool = False):
         if self.state["running"]:
             return
-        if not student.strip() or not password:
+        if not student.strip():
             self._message = "请输入学号和密码。"
             self.changed.emit()
             return
-        self._credentials = (student.strip(), password)
+        try:
+            if not password and student.strip() == self._saved_account:
+                saved = self.vault.load()
+                if saved is not None:
+                    password = saved[1]
+                saved = None
+            if not password:
+                raise ZjuError("请输入密码，或选择已记住密码的账号。")
+            self._credentials = seal_credentials(student.strip(), password)
+            password = ""
+            if not remember:
+                self.vault.forget()
+                self._saved_account = ""
+                self._has_saved_password = False
+            self._remember = self._remember_requested = remember
+        except (OSError, ZjuError) as exc:
+            self._credentials = None
+            self._message = str(exc) if isinstance(exc, ZjuError) else "无法访问本地加密缓存。"
+            self.changed.emit()
+            return
         self._stopping = self._quitting = False
+        self._paused = self._pause_pending = self._logged_in = False
         self._restarts.clear()
         self._activities.clear()
         self._success.clear()
         self._polls = 0
         self._last_poll = "—"
-        self._started = time.monotonic()
+        self._clock.reset()
         self._message = ""
         self.activitiesChanged.emit()
         self._spawn()
@@ -130,14 +182,28 @@ class DesktopBridge(QObject):
         self._restart_at = 0
         parent, child = self.context.Pipe()
         self.stop_event = self.context.Event()
+        self.pause_event = self.context.Event()
+        self._paused = self._pause_pending = self._logged_in = False
+        try:
+            if not isinstance(self._credentials, bytes):
+                raise CredentialError("本次凭据无效。")
+            credentials = self._credentials
+        except (OSError, ZjuError):
+            parent.close()
+            child.close()
+            self._credentials = None
+            self._status, self._message = "需要登录", "无法读取本次凭据，请重新输入。"
+            self.changed.emit()
+            return
         process = self.context.Process(
             target=worker_entry,
             args=(
                 self.store.settings,
-                self._credentials,
+                credentials,
                 child,
                 self.stop_event,
                 str(self.store.directory),
+                self.pause_event,
             ),
             name="zju-ac-desktop-worker",
         )
@@ -158,6 +224,8 @@ class DesktopBridge(QObject):
 
     @Slot()
     def stopMonitor(self):
+        self._clock.stop()
+        self._paused = self._pause_pending = self._logged_in = False
         self._restart_at = 0
         self._credentials = None
         self._prompts.clear()
@@ -169,9 +237,29 @@ class DesktopBridge(QObject):
             self._status = "正在停止"
         else:
             self._connected = self._stopping = False
-            self._status = "已暂停"
+            self._status = "已退出登录"
             if self._quitting:
                 self.quitReady.emit()
+        self.changed.emit()
+
+    @Slot()
+    def pauseMonitor(self):
+        if self.process is None or not self._logged_in or self._stopping or self._paused:
+            return
+        self.pause_event.set()
+        self._pause_pending = True
+        self._status = "正在暂停"
+        self._prompts.clear()
+        self.promptChanged.emit()
+        self.changed.emit()
+
+    @Slot()
+    def resumeMonitor(self):
+        if not self._paused or self._stopping or self.pause_event is None:
+            return
+        self._pause_pending = True
+        self._status = "正在恢复"
+        self.pause_event.clear()
         self.changed.emit()
 
     @Slot()
@@ -192,13 +280,16 @@ class DesktopBridge(QObject):
             self.connection.close()
             self.connection = None
             self._connected = False
+            self._logged_in = False
+            self._clock.stop()
+            self._paused = self._pause_pending = False
             self._prompts.clear()
             self.promptChanged.emit()
             if self._quitting:
                 self.quitReady.emit()
             elif self._stopping or code == 0:
                 self._credentials = None
-                self._status, self._stopping = "已暂停", False
+                self._status, self._stopping = "已退出登录", False
                 self.log("监控已停止。")
             else:
                 now = time.monotonic()
@@ -236,13 +327,39 @@ class DesktopBridge(QObject):
         if kind == "log":
             self.log(event["message"])
         elif kind == "connected":
+            if self._stopping:
+                return
+            self._logged_in = True
+            self._clock.start()
             self._connected, self._status, self._message = True, "正在监控", ""
+            if self._remember_requested and self._credentials is not None:
+                try:
+                    self.vault.save_blob(self._credentials)
+                    self._saved_account = open_credentials(self._credentials)[0]
+                    self._has_saved_password = True
+                except (OSError, ZjuError):
+                    self._message = "已登录，但加密缓存未保存，请检查用户目录权限。"
             self.changed.emit()
+        elif kind == "paused":
+            if not self._stopping:
+                self._paused, self._pause_pending = True, False
+                self._status = "已暂停 · 保持登录"
+                self._prompts.clear()
+                self.promptChanged.emit()
+                self.log("轮询和签到已暂停，登录会话保留。")
+                self.changed.emit()
+        elif kind == "resumed":
+            if not self._stopping:
+                self._paused = self._pause_pending = False
+                self._status = "正在监控"
+                self.log("监控已恢复，正在重新同步活动。")
+                self.changed.emit()
         elif kind == "poll":
             self._connected = True
             self._polls += 1
             self._last_poll = datetime.now().strftime("%H:%M:%S")
-            self._status = "正在监控"
+            if not self._paused and not self._pause_pending and not self._stopping:
+                self._status = "正在监控"
             live = {item["id"] for item in event["activities"]}
             for item in event["activities"]:
                 self._activities.setdefault(item["id"], item)
@@ -258,13 +375,16 @@ class DesktopBridge(QObject):
             self.changed.emit()
         elif kind == "retry":
             self._connected = False
-            self._status = "等待网络恢复"
+            if not self._paused and not self._pause_pending and not self._stopping:
+                self._status = "等待网络恢复"
             self.changed.emit()
         elif kind == "activity":
             item = event["activity"]
             self._activities[item["id"]] = item
             self.activitiesChanged.emit()
         elif kind in {"prompt", "otp"}:
+            if kind == "prompt" and (self._paused or self._pause_pending or self._stopping):
+                return
             self._prompts.append(event)
             self.promptChanged.emit()
             if self.store.settings.desktop:
@@ -309,9 +429,16 @@ class DesktopBridge(QObject):
                 self.log("连接已中断，请重新登录。", "warning")
         self.promptChanged.emit()
 
+    def _send_settings(self):
+        if self.connection is not None:
+            try:
+                self.connection.send({"type": "settings", "settings": self.store.settings})
+            except (EOFError, OSError):
+                self.log("设置已保存，将在重新登录后使用。", "warning")
+
     @Slot(str, result=bool)
     def saveSettings(self, content: str):
-        if self.state["running"]:
+        if not self.state["canEdit"]:
             self._message = "请先暂停监控，再修改设置。"
             self.changed.emit()
             return False
@@ -319,7 +446,10 @@ class DesktopBridge(QObject):
             updates = json.loads(content)
             if not isinstance(updates, dict):
                 raise ValueError
+            if self.process is not None and updates.get("mode") in {"demo", "once"}:
+                raise ZjuError("单次查询或离线演示请先退出登录再选择。")
             self.store.save(updates)
+            self._send_settings()
         except ZjuError as exc:
             self._message = str(exc)
         except (ValueError, TypeError, OSError):
@@ -339,10 +469,11 @@ class DesktopBridge(QObject):
 
     @Slot(str, float, float, result=bool)
     def saveLocation(self, name, latitude, longitude):
-        if self.state["running"]:
+        if not self.state["canEdit"]:
             return False
         try:
             self.store.save_location(name, latitude, longitude)
+            self._send_settings()
         except (ValueError, TypeError, OSError, ZjuError):
             self._message = "地点未保存，请填写名称与有效的经纬度。"
             self.changed.emit()
@@ -352,12 +483,31 @@ class DesktopBridge(QObject):
         self.changed.emit()
         return True
 
+    @Slot(bool)
+    def setRememberPassword(self, enabled):
+        if not enabled:
+            try:
+                self.vault.forget()
+            except OSError:
+                self._message = "无法清除加密缓存，请检查目录权限。"
+                self.changed.emit()
+                return
+            self._saved_account = ""
+            self._has_saved_password = False
+            self._remember_requested = False
+        self._remember = enabled
+        self.changed.emit()
+
+    @Slot()
+    def forgetPassword(self):
+        self.setRememberPassword(False)
+
     @Slot()
     def toggleTheme(self):
         self._dark = not self._dark
         try:
             (self.store.directory / "appearance.json").write_text(
-                json.dumps({"dark": self._dark}), "utf-8"
+                json.dumps({"schema": 2, "dark": self._dark}), "utf-8"
             )
         except OSError:
             pass

@@ -21,3 +21,4 @@ htmlcov/
 /README.md
 /docs/
 /使用说明.txt
+*.dpapi

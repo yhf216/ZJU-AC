@@ -25,6 +25,10 @@ class CodeRetry:
     next_read_at: float
 
 
+class MonitoringPaused(Exception):
+    """Internal scheduling signal; no write has been started."""
+
+
 @dataclass(frozen=True)
 class Prompt:
     record: Rollcall
@@ -102,6 +106,7 @@ class ConfirmedCheckin:
         notifier: Notifier | None = None,
         stop_event=None,
         on_status=None,
+        pause_event=None,
     ):
         self.client = client
         self.settings = settings if settings is not None else Settings()
@@ -109,6 +114,7 @@ class ConfirmedCheckin:
         self.notifier = notifier if notifier is not None else Notifier(desktop=False, bell=False)
         self.stop_event = stop_event
         self.on_status = on_status
+        self.pause_event = pause_event
         self.automatic: dict[str, WaitingActivity] = {}
         self.code_retries: dict[str, CodeRetry] = {}
         self.code_reads: dict[str, int] = {}
@@ -173,11 +179,15 @@ class ConfirmedCheckin:
             self.on_status(record, stage, message)
 
     def process(self) -> None:
+        if self.pause_event is not None and self.pause_event.is_set():
+            return
         if self.stop_event is not None and self.stop_event.is_set():
             return
         if self.closed:
             return
         self._process_automatic()
+        if self.pause_event is not None and self.pause_event.is_set():
+            return
         self._process_code_retries()
         for answer in self.prompts.poll():
             prompt = answer.prompt
@@ -208,6 +218,8 @@ class ConfirmedCheckin:
     def _process_automatic(self) -> None:
         policy = self.settings.gate_settings
         for rid, activity in list(self.automatic.items()):
+            if self.pause_event is not None and self.pause_event.is_set():
+                return
             now, now_utc = time.monotonic(), datetime.now(UTC)
             decision = deadline_decision(activity, policy, self.settings.gate, now, now_utc)
             if decision is None:
@@ -238,10 +250,13 @@ class ConfirmedCheckin:
             return
         self._status(record, "checking", "正在核对活动状态")
         try:
+            self._guard_pause()
             if record.kind == "GPS":
                 self._submit_gps(record)
             else:
                 self._submit_number(record, code)
+        except MonitoringPaused:
+            self.asked.discard(record.id)
         except AuthenticationExpired as exc:
             diagnostic("checkin_error", error=exc, activity=record.id)
             self._result(record, "failure")
@@ -250,6 +265,15 @@ class ConfirmedCheckin:
             diagnostic("checkin_error", error=exc, activity=record.id)
             print(f"{record.kind}签到未完成：{exc}", flush=True)
             self._result(record, "failure")
+
+    def _guard_pause(self):
+        if self.pause_event is not None and self.pause_event.is_set():
+            raise MonitoringPaused
+
+    def cancel_pending_prompts(self):
+        for rid in self.pending:
+            self.asked.discard(rid)
+        self.pending.clear()
 
     def _result(self, record: Rollcall, outcome: str) -> None:
         if record.id not in self.results:
@@ -264,6 +288,8 @@ class ConfirmedCheckin:
 
     def _process_code_retries(self) -> None:
         for rid, retry in list(self.code_retries.items()):
+            if self.pause_event is not None and self.pause_event.is_set():
+                return
             if retry.record.ends_at is not None and retry.record.ends_at <= datetime.now(UTC):
                 self.code_retries.pop(rid)
                 diagnostic("code_cancelled", activity=rid)
@@ -299,6 +325,7 @@ class ConfirmedCheckin:
             self._result(record, "failure")
 
     def _submit_number(self, record: Rollcall, code: str | None) -> None:
+        self._guard_pause()
         fresh = self.client.fresh_number(record)
         if fresh is None:
             print("该签到已结束、已完成或类型已变化，已取消提交。", flush=True)
@@ -309,6 +336,7 @@ class ConfirmedCheckin:
         if fresh.ends_at is not None and fresh.ends_at <= datetime.now(UTC):
             self._result(fresh, "failure")
             return
+        self._guard_pause()
         status = self.client.my_rollcall_status(fresh)
         if status in SIGNED:
             print("本人已签到，无需重复提交。", flush=True)
@@ -319,6 +347,7 @@ class ConfirmedCheckin:
             self._result(fresh, "failure")
             return
         if code is None:
+            self._guard_pause()
             if self.code_reads.get(record.id, 0) >= self.settings.code_retry.max_attempts:
                 self._result(fresh, "failure")
                 return
@@ -329,12 +358,14 @@ class ConfirmedCheckin:
                 self._missing_code(fresh)
                 return
         # Code lookup or manual input can take time; check activity again just before PUT.
+        self._guard_pause()
         if (
             fresh.ends_at is not None and fresh.ends_at <= datetime.now(UTC)
         ) or self.client.fresh_number(fresh) is None:
             print("提交前活动已结束或已完成，已取消提交。", flush=True)
             return
         try:
+            self._guard_pause()
             if self.stop_event is not None and self.stop_event.is_set():
                 return
             self._status(fresh, "submitting", "正在提交")
@@ -346,6 +377,7 @@ class ConfirmedCheckin:
         self._verify(fresh)
 
     def _submit_gps(self, record: Rollcall) -> None:
+        self._guard_pause()
         location = self.settings.gps
         if location is None:
             print("未配置 GPS 地点，已取消提交。", flush=True)
@@ -354,6 +386,7 @@ class ConfirmedCheckin:
         if fresh is None:
             print("GPS 活动已结束、已完成或类型已变化，已取消后续定位请求。", flush=True)
             return
+        self._guard_pause()
         status = self.client.my_rollcall_status(fresh)
         if status in SIGNED:
             print("本人已签到，无需继续定位请求。", flush=True)
@@ -364,6 +397,7 @@ class ConfirmedCheckin:
             self._result(fresh, "failure")
             return
         try:
+            self._guard_pause()
             if self.stop_event is not None and self.stop_event.is_set():
                 return
             self._status(fresh, "submitting", "正在提交")

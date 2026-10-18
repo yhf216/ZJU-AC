@@ -132,7 +132,9 @@ def test_desktop_worker_handles_otp_consent_and_manual_code_without_console(tmp_
         assert otp_reader("challenge") == "654321"
         yield client
 
-    def fake_monitor(client, notifier, *args, checkin, stop_event, on_poll, on_failure):
+    def fake_monitor(
+        client, notifier, *args, checkin, stop_event, on_poll, on_failure, session_control
+    ):
         on_poll([activity])
         checkin.observe([activity])
         checkin.process()

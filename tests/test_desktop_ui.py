@@ -9,10 +9,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QMetaObject, QObject, QUrl
-from PySide6.QtGui import QFontDatabase
+from PySide6.QtCore import QMetaObject, QObject, QPoint, QPointF, Qt, QUrl
+from PySide6.QtGui import QFontDatabase, QWheelEvent
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from zju_ac.config import CONFIG_PATH
@@ -51,6 +52,26 @@ def test_qml_pages_and_password_clearing(application, bridge):
     for page in (0, 1, 2):
         window.setProperty("page", page)
         application.processEvents()
+    window.setProperty("page", 0)
+    window.setWidth(620)
+    window.setHeight(480)
+    QTest.qWait(100)
+    scroll = window.findChild(QObject, "mainScroll")
+    flickable = scroll.property("contentItem")
+    assert flickable.property("contentHeight") > flickable.property("height")
+    event = QWheelEvent(
+        QPointF(550, 80),
+        QPointF(550, 80),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.NoButton,
+        Qt.NoModifier,
+        Qt.ScrollUpdate,
+        False,
+    )
+    application.sendEvent(window, event)
+    QTest.qWait(150)
+    assert flickable.property("contentY") > 0
     dialog = window.findChild(QObject, "loginDialog")
     password = window.findChild(QObject, "passwordField")
     QMetaObject.invokeMethod(dialog, "open")
@@ -138,3 +159,88 @@ def test_network_status_recovers_after_next_successful_poll(bridge):
     bridge.handle({"type": "poll", "activities": []})
     assert bridge.state["connected"]
     assert bridge.state["status"] == "正在监控"
+
+
+def test_default_theme_is_dark_and_pause_keeps_credentials_and_clock(bridge, monkeypatch):
+    import threading
+
+    now = [100.0]
+    monkeypatch.setattr("zju_ac.desktop.bridge.time.monotonic", lambda: now[0])
+    assert bridge.state["dark"]
+    bridge.process = Mock()
+    bridge.pause_event = threading.Event()
+    bridge._credentials = b"encrypted-session"
+    bridge.handle({"type": "connected"})
+    now[0] = 110
+    bridge.pauseMonitor()
+    assert bridge.pause_event.is_set()
+    bridge.handle({"type": "paused"})
+    assert bridge._credentials == b"encrypted-session"
+    assert bridge.state["authenticated"]
+    assert bridge.state["canEdit"]
+    now[0] = 130
+    assert bridge.state["uptime"] == "00:00:30"
+    bridge.resumeMonitor()
+    assert not bridge.pause_event.is_set()
+    assert not bridge.state["canEdit"]
+    bridge.handle({"type": "resumed"})
+    assert not bridge.state["paused"]
+    bridge.process = None
+    bridge.stopMonitor()
+    now[0] = 200
+    assert bridge.state["uptime"] == "00:00:30"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI")
+def test_remembered_credentials_saved_only_after_success_and_never_exposed_to_qml(
+    bridge, monkeypatch
+):
+    from zju_ac.desktop.credentials import open_credentials
+
+    monkeypatch.setattr(bridge, "_spawn", Mock())
+    bridge.startMonitor("private-student", "private-password", True)
+    assert not bridge.vault.path.exists()
+    assert open_credentials(bridge._credentials) == ("private-student", "private-password")
+    assert "private-password" not in json.dumps(bridge.state)
+    bridge.handle({"type": "connected"})
+    assert bridge.vault.load() == ("private-student", "private-password")
+    bridge._credentials = None
+    bridge.startMonitor("private-student", "", True)
+    assert open_credentials(bridge._credentials)[1] == "private-password"
+    bridge.forgetPassword()
+    assert not bridge.vault.path.exists()
+    assert not bridge.state["hasSavedPassword"]
+
+
+def test_old_theme_defaults_migrate_to_dark_and_explicit_new_choice_persists(bridge):
+    appearance = bridge.store.directory / "appearance.json"
+    appearance.write_text(json.dumps({"dark": False}), encoding="utf-8")
+    upgraded = DesktopBridge(bridge.store)
+    try:
+        assert upgraded.state["dark"]
+        upgraded.toggleTheme()
+    finally:
+        upgraded.shutdown()
+    restored = DesktopBridge(bridge.store)
+    try:
+        assert not restored.state["dark"]
+    finally:
+        restored.shutdown()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI")
+def test_spawn_transports_ciphertext_and_unchecked_remember_never_writes_cache(bridge):
+    from zju_ac.desktop.credentials import open_credentials
+
+    parent, child, process = Mock(), Mock(), Mock()
+    context = Mock()
+    context.Pipe.return_value = (parent, child)
+    context.Process.return_value = process
+    bridge.context = context
+    bridge.startMonitor("private-student", "private-password", False)
+    transferred = context.Process.call_args.kwargs["args"][1]
+    assert isinstance(transferred, bytes)
+    assert b"private-password" not in transferred
+    assert open_credentials(transferred)[1] == "private-password"
+    bridge.handle({"type": "connected"})
+    assert not bridge.vault.path.exists()

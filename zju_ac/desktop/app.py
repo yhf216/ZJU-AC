@@ -92,7 +92,9 @@ def main() -> int:
 
     for label, callback in (
         ("打开窗口", show_window),
-        ("暂停监控", bridge.stopMonitor),
+        ("暂停监控", bridge.pauseMonitor),
+        ("继续监控", bridge.resumeMonitor),
+        ("退出登录", bridge.stopMonitor),
         ("退出", bridge.requestQuit),
     ):
         action = QAction(label, menu)
@@ -126,6 +128,20 @@ def main() -> int:
 
         def capture_dark():
             window.grabWindow().save(str(directory / "desktop-dark.png"))
+            window.setWidth(620)
+            window.setHeight(480)
+            QTimer.singleShot(300, capture_compact)
+
+        def capture_compact():
+            window.grabWindow().save(str(directory / "desktop-compact.png"))
+            scroll = window.findChild(QObject, "mainScroll").property("contentItem")
+            scroll.setProperty(
+                "contentY", max(0, scroll.property("contentHeight") - scroll.height())
+            )
+            QTimer.singleShot(300, capture_compact_bottom)
+
+        def capture_compact_bottom():
+            window.grabWindow().save(str(directory / "desktop-compact-bottom.png"))
             app.quit()
 
         def capture_login():

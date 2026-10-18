@@ -40,12 +40,30 @@ def run_monitor(
     stop_event=None,
     on_poll=None,
     on_failure=None,
+    session_control=None,
 ) -> None:
     tracker = ReminderTracker(repeat_after)
     failures = 0
+    controller = checkin
+
+    def wait(delay):
+        if session_control is not None:
+            session_control.wait(delay, checkin)
+        elif checkin is None:
+            stop_event.wait(delay) if stop_event is not None else time.sleep(delay)
+        else:
+            checkin.wait(delay)
+
     while True:
         if stop_event is not None and stop_event.is_set():
             return
+        if session_control is not None:
+            if not session_control.before_poll(controller):
+                return
+            options = session_control.settings
+            interval, repeat_after, once = options.interval, options.remind_every, options.once
+            tracker.repeat_after = repeat_after
+            checkin = None if options.reminders_only or once else controller
         started = time.monotonic()
         try:
             records = client.rollcalls()
@@ -58,15 +76,14 @@ def run_monitor(
             if on_failure is not None:
                 on_failure(delay)
             LOGGER.warning("%s %.0f 秒后重试。", exc, delay)
-            if checkin is None:
-                stop_event.wait(delay) if stop_event is not None else time.sleep(delay)
-            else:
-                checkin.wait(delay)
+            wait(delay)
             continue
         failures = 0
         diagnostic("poll_ok", count=len(records))
         if stop_event is not None and stop_event.is_set():
             return
+        if session_control is not None and session_control.paused:
+            continue
         if on_poll is not None:
             on_poll(records)
         LOGGER.info("监控正常：当前有 %d 项待签到。", len(records))
@@ -80,7 +97,4 @@ def run_monitor(
         if once:
             return
         delay = max(0, interval - (time.monotonic() - started))
-        if checkin is None:
-            stop_event.wait(delay) if stop_event is not None else time.sleep(delay)
-        else:
-            checkin.wait(delay)
+        wait(delay)

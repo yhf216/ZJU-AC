@@ -2,12 +2,14 @@
 
 import logging
 import sys
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 from ..auth import login
 from ..checkin import Answer, ConfirmedCheckin, display
+from ..config import Settings
 from ..diagnostics import export_bundle, record, setup
 from ..errors import AuthenticationExpired, TemporaryError, ZjuError
 from ..monitor import run_monitor
@@ -51,6 +53,8 @@ class DesktopPrompts:
     def __init__(self, connection, stop_event):
         self.connection, self.stop_event = connection, stop_event
         self.pending = {}
+        self.answers = []
+        self.settings_callback = None
 
     def ask(self, prompt):
         token = uuid.uuid4().hex
@@ -64,16 +68,26 @@ class DesktopPrompts:
             }
         )
 
-    def poll(self):
-        answers = []
+    def pump(self):
         while self.connection.poll():
             message = self.connection.recv()
+            if message.get("type") == "settings" and self.settings_callback is not None:
+                self.settings_callback(message.get("settings"))
+                continue
             if message.get("type") != "answer":
                 continue
             prompt = self.pending.pop(message.get("token"), None)
             if prompt is not None:
-                answers.append(Answer(prompt, str(message.get("value", ""))))
+                self.answers.append(Answer(prompt, str(message.get("value", ""))))
+
+    def poll(self):
+        self.pump()
+        answers, self.answers = self.answers, []
         return answers
+
+    def cancel_pending(self):
+        self.pending.clear()
+        self.answers.clear()
 
     def otp(self, message):
         token = uuid.uuid4().hex
@@ -86,7 +100,61 @@ class DesktopPrompts:
         raise Cancelled
 
     def close(self):
-        self.pending.clear()
+        self.cancel_pending()
+
+
+class DesktopSession:
+    def __init__(self, settings, prompts, notifier, stop_event, pause_event, send):
+        self.settings, self.prompts, self.notifier = settings, prompts, notifier
+        self.stop_event, self.pause_event, self.send = stop_event, pause_event, send
+        self.was_paused = False
+        self.controller = None
+        prompts.settings_callback = self.apply_settings
+
+    @property
+    def paused(self):
+        return self.pause_event is not None and self.pause_event.is_set()
+
+    def apply_settings(self, settings):
+        if isinstance(settings, Settings) and (self.paused or self.was_paused):
+            self.settings = settings
+            self.notifier.settings = settings
+            if self.controller is not None:
+                self.controller.settings = settings
+
+    def before_poll(self, controller):
+        self.controller = controller
+        self.prompts.pump()
+        if self.paused:
+            if controller is not None:
+                controller.cancel_pending_prompts()
+            self.prompts.cancel_pending()
+            self.send({"type": "paused"})
+            self.was_paused = True
+            while self.paused and not self.stop_event.wait(0.1):
+                self.prompts.pump()
+        # Drain settings sent before the resume signal, even if both arrived together.
+        self.prompts.pump()
+        if controller is not None:
+            controller.settings = self.settings
+        if self.was_paused and not self.stop_event.is_set():
+            self.was_paused = False
+            self.send({"type": "resumed"})
+        return not self.stop_event.is_set()
+
+    def wait(self, seconds, controller):
+        deadline = time.monotonic() + seconds
+        while not self.stop_event.is_set():
+            self.prompts.pump()
+            if self.paused:
+                self.before_poll(self.controller)
+                return  # Resume always starts with fresh discovery.
+            if controller is not None:
+                controller.process()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self.stop_event.wait(min(0.2, remaining))
 
 
 class DesktopNotifier:
@@ -119,7 +187,7 @@ class DesktopNotifier:
         )
 
 
-def worker_entry(settings, credentials, connection, stop_event, directory: str):
+def worker_entry(settings, credentials, connection, stop_event, directory: str, pause_event=None):
     setup(Path(directory) / "logs")
     original_out, original_err = sys.stdout, sys.stderr
     stream = EventStream(connection.send)
@@ -149,7 +217,12 @@ def worker_entry(settings, credentials, connection, stop_event, directory: str):
                     }
                 )
             return
-        student, password = credentials
+        if isinstance(credentials, bytes):
+            from .credentials import open_credentials
+
+            student, password = open_credentials(credentials)
+        else:
+            student, password = credentials
         del credentials
         with login(student, password, settings.login_timeout, otp_reader=prompts.otp) as client:
             password = ""
@@ -164,17 +237,17 @@ def worker_entry(settings, credentials, connection, stop_event, directory: str):
                     }
                 )
 
-            controller = (
-                None
-                if settings.reminders_only or settings.once
-                else ConfirmedCheckin(
-                    client,
-                    prompts,
-                    settings=settings,
-                    notifier=notifier,
-                    stop_event=stop_event,
-                    on_status=status,
-                )
+            controller = ConfirmedCheckin(
+                client,
+                prompts,
+                settings=settings,
+                notifier=notifier,
+                stop_event=stop_event,
+                on_status=status,
+                pause_event=pause_event,
+            )
+            control = DesktopSession(
+                settings, prompts, notifier, stop_event, pause_event, connection.send
             )
             run_monitor(
                 client,
@@ -192,6 +265,7 @@ def worker_entry(settings, credentials, connection, stop_event, directory: str):
                     }
                 ),
                 on_failure=lambda delay: connection.send({"type": "retry", "delay": int(delay)}),
+                session_control=control,
             )
     except (Cancelled, EOFError, BrokenPipeError):
         pass
@@ -231,6 +305,13 @@ def smoke_test(directory: Path) -> int:
     from ..config import Settings
 
     directory.mkdir(parents=True, exist_ok=True)
+    from .credentials import CredentialVault, seal_credentials
+
+    vault = CredentialVault(directory)
+    vault.save_blob(seal_credentials("offline-test", "unused-test-password"))
+    if vault.load() != ("offline-test", "unused-test-password"):
+        return 1
+    vault.forget()
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe()
     stop = context.Event()
