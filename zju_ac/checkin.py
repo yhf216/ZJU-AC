@@ -3,18 +3,26 @@
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from .client import CoursesClient, number_code
 from .config import Settings
+from .diagnostics import record as diagnostic
 from .errors import AuthenticationExpired, SubmissionUncertain, ZjuError
 from .gate import WaitingActivity, deadline_decision, evaluate_gate
 from .models import SIGNED, AttendanceProgress, Rollcall
+from .notify import Notifier
 
 
 def display(value: str) -> str:
     return "".join(c for c in value if c.isprintable())[:160]
+
+
+@dataclass(frozen=True)
+class CodeRetry:
+    record: Rollcall
+    next_read_at: float
 
 
 @dataclass(frozen=True)
@@ -91,11 +99,16 @@ class ConfirmedCheckin:
         prompts: TerminalPrompts | None = None,
         *,
         settings: Settings | None = None,
+        notifier: Notifier | None = None,
     ):
         self.client = client
         self.settings = settings if settings is not None else Settings()
         self.prompts = prompts if prompts is not None else TerminalPrompts()
+        self.notifier = notifier if notifier is not None else Notifier(desktop=False, bell=False)
         self.automatic: dict[str, WaitingActivity] = {}
+        self.code_retries: dict[str, CodeRetry] = {}
+        self.code_reads: dict[str, int] = {}
+        self.results: set[str] = set()
         self.asked: set[str] = set()
         self.pending: dict[str, Prompt] = {}
         self.closed = False
@@ -104,6 +117,21 @@ class ConfirmedCheckin:
         if self.closed:
             return
         live = {record.id for record in records}
+        current = {record.id: record for record in records}
+        for rid, retry in list(self.code_retries.items()):
+            latest = current.get(rid)
+            if (
+                latest is None
+                or latest.kind != "数字"
+                or latest.course_id != retry.record.course_id
+            ):
+                self.code_retries.pop(rid)
+                diagnostic("code_cancelled", activity=rid)
+            else:
+                ends = [end for end in (latest.ends_at, retry.record.ends_at) if end is not None]
+                self.code_retries[rid] = CodeRetry(
+                    replace(latest, ends_at=min(ends) if ends else None), retry.next_read_at
+                )
         for rid in self.automatic.keys() - live:
             self.automatic.pop(rid)
             print(f"[门控取消] 活动 {display(rid)} 已不在待签到列表。", flush=True)
@@ -136,6 +164,7 @@ class ConfirmedCheckin:
         if self.closed:
             return
         self._process_automatic()
+        self._process_code_retries()
         for answer in self.prompts.poll():
             prompt = answer.prompt
             if self.pending.get(prompt.record.id) != prompt:
@@ -183,7 +212,9 @@ class ConfirmedCheckin:
             self.automatic.pop(rid)
             if decision.action == "submit":
                 print(f"自动处理{activity.record.kind}签到（编号 {display(rid)}）。", flush=True)
-                self._submit(activity.record)
+                self._submit(replace(activity.record, ends_at=activity.ends_at))
+            else:
+                self._result(activity.record, "failure")
 
     def _submit(self, record: Rollcall, code: str | None = None) -> None:
         try:
@@ -191,38 +222,97 @@ class ConfirmedCheckin:
                 self._submit_gps(record)
             else:
                 self._submit_number(record, code)
-        except AuthenticationExpired:
+        except AuthenticationExpired as exc:
+            diagnostic("checkin_error", error=exc, activity=record.id)
+            self._result(record, "failure")
             raise
         except ZjuError as exc:
+            diagnostic("checkin_error", error=exc, activity=record.id)
             print(f"{record.kind}签到未完成：{exc}", flush=True)
+            self._result(record, "failure")
+
+    def _result(self, record: Rollcall, outcome: str) -> None:
+        if record.id not in self.results:
+            self.results.add(record.id)
+            diagnostic("result", activity=record.id, outcome=outcome)
+            self.notifier.result(record, outcome)
+
+    def _process_code_retries(self) -> None:
+        for rid, retry in list(self.code_retries.items()):
+            if retry.record.ends_at is not None and retry.record.ends_at <= datetime.now(UTC):
+                self.code_retries.pop(rid)
+                diagnostic("code_cancelled", activity=rid)
+                print(f"[取码结束] 活动 {display(rid)} 已截止。", flush=True)
+                self._result(retry.record, "failure")
+            elif time.monotonic() >= retry.next_read_at:
+                self.code_retries.pop(rid)
+                self._submit(retry.record)
+
+    def _missing_code(self, record: Rollcall) -> None:
+        attempts = self.code_reads[record.id]
+        diagnostic("code_missing", activity=record.id, attempt=attempts)
+        if not self.settings.auto_checkin:
+            self._ask(Prompt(record, "code"))
+            return
+        policy = self.settings.code_retry
+        if attempts < policy.max_attempts:
+            self.code_retries[record.id] = CodeRetry(
+                record, time.monotonic() + policy.interval_seconds
+            )
+            diagnostic(
+                "code_retry", activity=record.id, attempt=attempts, delay=policy.interval_seconds
+            )
+            print(
+                f"自动取不到数字码（第 {attempts}/{policy.max_attempts} 轮），"
+                f"至少 {policy.interval_seconds} 秒后重读，不提交或猜测数字码。",
+                flush=True,
+            )
+        else:
+            diagnostic("code_exhausted", activity=record.id, attempt=attempts)
+            print(f"[取码结束] 已读 {attempts} 轮仍无数字码，请使用畅课处理。", flush=True)
+            self._result(record, "failure")
 
     def _submit_number(self, record: Rollcall, code: str | None) -> None:
         fresh = self.client.fresh_number(record)
         if fresh is None:
             print("该签到已结束、已完成或类型已变化，已取消提交。", flush=True)
+            diagnostic("code_cancelled", activity=record.id)
+            return
+        ends = [end for end in (fresh.ends_at, record.ends_at) if end is not None]
+        fresh = replace(fresh, ends_at=min(ends) if ends else None)
+        if fresh.ends_at is not None and fresh.ends_at <= datetime.now(UTC):
+            self._result(fresh, "failure")
             return
         status = self.client.my_rollcall_status(fresh)
         if status in SIGNED:
             print("本人已签到，无需重复提交。", flush=True)
+            self._result(fresh, "success")
             return
         if status != "absent":
             print("本人状态不是明确的待签到状态，已取消提交。", flush=True)
+            self._result(fresh, "failure")
             return
         if code is None:
+            if self.code_reads.get(record.id, 0) >= self.settings.code_retry.max_attempts:
+                self._result(fresh, "failure")
+                return
+            self.code_reads[record.id] = self.code_reads.get(record.id, 0) + 1
+            diagnostic("code_read", activity=record.id, attempt=self.code_reads[record.id])
             code = self.client.read_number_code(fresh)
             if code is None:
-                if self.settings.auto_checkin:
-                    print("自动取不到数字码，本次仅提醒，不提交或猜测数字码。", flush=True)
-                else:
-                    self._ask(Prompt(fresh, "code"))
+                self._missing_code(fresh)
                 return
         # Code lookup or manual input can take time; check activity again just before PUT.
-        if self.client.fresh_number(fresh) is None:
+        if (
+            fresh.ends_at is not None and fresh.ends_at <= datetime.now(UTC)
+        ) or self.client.fresh_number(fresh) is None:
             print("提交前活动已结束或已完成，已取消提交。", flush=True)
             return
         try:
+            diagnostic("submit_started", activity=fresh.id, channel="number")
             self.client.submit_number(fresh, code)
         except SubmissionUncertain as exc:
+            diagnostic("submit_uncertain", activity=fresh.id, error=exc)
             print(str(exc), flush=True)
         self._verify(fresh)
 
@@ -238,31 +328,41 @@ class ConfirmedCheckin:
         status = self.client.my_rollcall_status(fresh)
         if status in SIGNED:
             print("本人已签到，无需继续定位请求。", flush=True)
+            self._result(fresh, "success")
             return
         if status != "absent":
             print("本人状态不是明确的待签到状态，已取消后续定位请求。", flush=True)
+            self._result(fresh, "failure")
             return
         try:
+            diagnostic("submit_started", activity=fresh.id, channel="gps")
             self.client.submit_gps(fresh, location.coordinates, accuracy=location.accuracy)
         except SubmissionUncertain as exc:
+            diagnostic("submit_uncertain", activity=fresh.id, error=exc)
             print(str(exc), flush=True)
         self._verify(fresh)
 
     def _verify(self, fresh: Rollcall) -> None:
         try:
             verified = self.client.verify_attendance(fresh)
-        except AuthenticationExpired:
+        except AuthenticationExpired as exc:
+            diagnostic("verification_error", activity=fresh.id, error=exc)
+            self._result(fresh, "pending")
             print("[待核验] 提交后会话失效，请在畅课中查看签到结果。", flush=True)
             raise
         except ZjuError as exc:
+            diagnostic("verification_error", activity=fresh.id, error=exc)
+            self._result(fresh, "pending")
             print(f"[待核验] 无法回查本人状态：{exc} 不会自动重复提交。", flush=True)
             return
         if verified:
+            self._result(fresh, "success")
             print(
                 f"[签到成功] {display(fresh.course)}（编号 {display(fresh.id)}），本人状态已确认。",
                 flush=True,
             )
         else:
+            self._result(fresh, "pending")
             print("[待核验] 尚未确认本人签到成功，请在畅课中查看；不会自动重复提交。", flush=True)
 
     def wait(self, seconds: float) -> None:
@@ -278,4 +378,5 @@ class ConfirmedCheckin:
         self.closed = True
         self.pending.clear()
         self.automatic.clear()
+        self.code_retries.clear()
         self.prompts.close()

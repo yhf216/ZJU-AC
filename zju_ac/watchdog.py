@@ -9,6 +9,8 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from .diagnostics import record as diagnostic
+from .diagnostics import report_error, setup
 from .notify import configure_terminal
 
 LOGGER = logging.getLogger(__name__)
@@ -52,12 +54,14 @@ def worker_entry(args, credentials: Credentials) -> None:
     from .errors import ZjuError
 
     configure_terminal()
+    setup()
     try:
         with worker_terminal():
             code = run_application(args, credentials, supervised=True)
     except (KeyboardInterrupt, EOFError):
         code = 0
     except ZjuError as exc:
+        report_error("worker_error", exc)
         print(f"错误：{exc}", file=sys.stderr)
         code = USER_ACTION_REQUIRED
     raise SystemExit(code)
@@ -104,6 +108,7 @@ def run_watchdog(args, credentials: Credentials) -> int:
             LOGGER.info("工作进程已启动（PID %s）。", worker.pid)
             worker.join()
             code = worker.exitcode
+            diagnostic("worker_exit", count=code if type(code) is int and code >= 0 else None)
             worker.close()
             worker = None
             if code == 0:

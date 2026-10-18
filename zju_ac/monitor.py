@@ -6,6 +6,7 @@ from collections import OrderedDict
 
 from .checkin import ConfirmedCheckin
 from .client import CoursesClient
+from .diagnostics import record as diagnostic
 from .errors import TemporaryError
 from .models import Rollcall
 from .notify import Notifier
@@ -44,6 +45,7 @@ def run_monitor(
         try:
             records = client.rollcalls()
         except TemporaryError as exc:
+            diagnostic("poll_error", error=exc)
             if once:
                 raise
             failures += 1
@@ -55,6 +57,7 @@ def run_monitor(
                 checkin.wait(delay)
             continue
         failures = 0
+        diagnostic("poll_ok", count=len(records))
         LOGGER.info("监控正常：当前有 %d 项待签到。", len(records))
         for record in records:
             if tracker.due(record, started):

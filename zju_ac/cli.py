@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import Settings, load_config
+from .diagnostics import report_error, setup
 from .errors import AuthenticationExpired, TemporaryError, ZjuError
 from .models import Rollcall
 from .notify import Notifier, configure_terminal
@@ -24,9 +25,11 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     configure_terminal()
     parser().parse_args(argv)
+    setup()
     try:
         settings = load_config()
     except ZjuError as exc:
+        report_error("config_error", exc)
         print(f"配置错误：{exc}", file=sys.stderr)
         return USER_ACTION_REQUIRED
     return run_application(settings)
@@ -38,10 +41,19 @@ def run_application(
     supervised: bool = False,
 ) -> int:
     configure_terminal()
+    setup()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     notifier = Notifier(desktop=args.desktop, bell=args.bell)
     if args.demo:
-        notifier.send(Rollcall("demo", "演示课程", "这是一条离线测试提醒", "数字"))
+        demo = Rollcall("demo", "演示课程（离线测试）", "这是一条离线测试提醒", "数字")
+        notifier.send(demo)
+        for outcome, label in (
+            ("success", "签到成功"),
+            ("failure", "签到未完成"),
+            ("pending", "签到待核验"),
+        ):
+            print(f"[离线演示] {label}通知。", flush=True)
+            notifier.result(demo, outcome)
         return 0
     if credentials is None and not sys.stdin.isatty():
         print("请在交互终端运行，以便安全输入学号和密码。", file=sys.stderr)
@@ -66,7 +78,7 @@ def run_application(
             checkin = (
                 None
                 if args.reminders_only or args.once
-                else ConfirmedCheckin(client, settings=args)
+                else ConfirmedCheckin(client, settings=args, notifier=notifier)
             )
             try:
                 run_monitor(
@@ -85,12 +97,15 @@ def run_application(
         print("\n已退出。")
         return 0
     except (AuthenticationExpired, TemporaryError) as exc:
+        report_error("application_error", exc)
         print(f"错误：{exc}", file=sys.stderr)
         return 1
     except ZjuError as exc:
+        report_error("application_error", exc)
         print(f"错误：{exc}", file=sys.stderr)
         return USER_ACTION_REQUIRED if supervised else 1
     except ModuleNotFoundError as exc:
+        report_error("application_error", exc)
         package = {"requests": "requests", "bs4": "beautifulsoup4"}.get(exc.name)
         missing = f"缺少运行依赖 {package}" if package else "运行依赖安装不完整"
         print(
@@ -101,6 +116,7 @@ def run_application(
         )
         return USER_ACTION_REQUIRED if supervised else 1
     except Exception as exc:
+        report_error("application_error", exc)
         # Report a code location, never exception arguments, credentials, or ticket URLs.
         frame = traceback.extract_tb(exc.__traceback__)[-1]
         location = f"{Path(frame.filename).name}:{frame.lineno}"

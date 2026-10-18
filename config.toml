@@ -11,7 +11,12 @@ login_timeout = 180           # 登录时间预算秒数，至少 5。
 [checkin]
 auto_checkin = true           # 默认自动签到；false：终端输入 y/yes 并回车确认。
 gate = "attendance"          # attendance：按下方人数门控；immediate：直接签到。
-# 自动取不到数字码时仅提醒、不提交；手动模式可补输课堂公布的码。
+# 自动缺码按下方配置低频重读；手动模式可补输课堂公布的码。
+
+[checkin.code_retry]
+max_attempts = 5              # 含首次，允许 1–5 轮；每轮最多两个只读取码通道。
+interval_seconds = 30         # 上轮结束后至少等 30 秒；不会压缩间隔赶截止时间。
+# 只重读取码，不枚举数字，不重试签到提交；进程重启后计数重新开始。
 
 [checkin.gate_settings]
 # 两条人数条件任一满足即放行；“超过”是严格大于，等于阈值仍等待。

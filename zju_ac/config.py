@@ -28,6 +28,12 @@ class GateSettings:
 
 
 @dataclass(frozen=True)
+class CodeRetrySettings:
+    max_attempts: int = 5
+    interval_seconds: int = 30
+
+
+@dataclass(frozen=True)
 class Settings:
     mode: str = "monitor"
     interval: int = 15
@@ -36,6 +42,7 @@ class Settings:
     auto_checkin: bool = True
     gate: str = "attendance"
     gate_settings: GateSettings = field(default_factory=GateSettings)
+    code_retry: CodeRetrySettings = field(default_factory=CodeRetrySettings)
     desktop: bool = True
     bell: bool = True
     watchdog: bool = True
@@ -122,7 +129,12 @@ def load_config(path: Path | None = None) -> Settings:
     if data.keys() - {"runtime", "checkin", "notifications", "watchdog", "gps"}:
         raise ZjuError("config.toml 存在未知配置节，请对照项目示例。")
     runtime = _table(data, "runtime", {"mode", "interval", "remind_every", "login_timeout"})
-    checkin = _table(data, "checkin", {"auto_checkin", "gate", "gate_settings"})
+    checkin = _table(data, "checkin", {"auto_checkin", "gate", "gate_settings", "code_retry"})
+    retry = _table(checkin, "code_retry", {"max_attempts", "interval_seconds"})
+    attempts = _integer(retry, "max_attempts", 5, 1)
+    if attempts > 5:
+        raise ZjuError("config.toml 的 max_attempts 最多为 5（含首次取码）。")
+    code_retry = CodeRetrySettings(attempts, _integer(retry, "interval_seconds", 30, 30))
     gate = _table(
         checkin,
         "gate_settings",
@@ -145,6 +157,7 @@ def load_config(path: Path | None = None) -> Settings:
         remind_every=_integer(runtime, "remind_every", 0, 5, zero=True),
         login_timeout=_integer(runtime, "login_timeout", 180, 5),
         auto_checkin=_boolean(checkin, "auto_checkin", True),
+        code_retry=code_retry,
         gate=_choice(checkin, "gate", "attendance", {"immediate", "attendance"}),
         gate_settings=GateSettings(
             signed_ratio=float(ratio),

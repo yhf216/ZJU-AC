@@ -9,6 +9,7 @@ from typing import Any
 
 import requests
 
+from .diagnostics import record as diagnostic
 from .errors import (
     AuthenticationExpired,
     CheckinRejected,
@@ -67,7 +68,20 @@ class CoursesClient:
                 **options,
             )
         except requests.RequestException as exc:
+            diagnostic("network_error", error=exc)
             raise TemporaryError("直连请求失败，请检查网络或校园网连接。") from exc
+        channel = (
+            "profile"
+            if path == "/api/profile"
+            else "discovery"
+            if path == "/api/radar/rollcalls"
+            else "timetable"
+            if path == "/api/timetable_rollcalls"
+            else "own_status"
+            if path.startswith("/api/course/")
+            else "detail"
+        )
+        diagnostic("http_response", channel=channel, http_status=response.status_code)
         return self._read_response(response)
 
     @staticmethod
@@ -133,7 +147,8 @@ class CoursesClient:
             rid = api_id(record.id)
             api_id(record.course_id)
             return attendance_progress(self.get_json(f"/api/rollcall/{rid}/student_rollcalls"))
-        except (PermissionDenied, ProtocolError, TemporaryError):
+        except (PermissionDenied, ProtocolError, TemporaryError) as exc:
+            diagnostic("channel_error", channel="detail", error=exc)
             # Per user policy, unavailable roster data releases only the gate.
             # Activity and own attendance still must be checked before submission.
             return None
@@ -164,7 +179,8 @@ class CoursesClient:
             if isinstance(detail, dict) and (code := number_code(detail.get("number_code"))):
                 LOGGER.info("数字码已从点名详情通道获取（活动 %s）。", rid)
                 return code
-        except (PermissionDenied, ProtocolError, TemporaryError):
+        except (PermissionDenied, ProtocolError, TemporaryError) as exc:
+            diagnostic("channel_error", channel="detail", error=exc)
             LOGGER.warning("点名详情取码通道不可用，尝试课表日期通道（活动 %s）。", rid)
         if record.course_id is None or record.started_at is None:
             return None
@@ -176,8 +192,9 @@ class CoursesClient:
                     "rollcall_date": record.started_at.astimezone(UTC).date().isoformat(),
                 },
             )
-        except (PermissionDenied, ProtocolError, TemporaryError):
-            LOGGER.warning("课表日期取码通道不可用，将提示手动输入（活动 %s）。", rid)
+        except (PermissionDenied, ProtocolError, TemporaryError) as exc:
+            diagnostic("channel_error", channel="timetable", error=exc)
+            LOGGER.warning("课表日期取码通道不可用（活动 %s）。", rid)
             return None
         items = payload.get("rollcalls", []) if isinstance(payload, dict) else []
         if not isinstance(items, list):
@@ -229,6 +246,7 @@ class CoursesClient:
             )
         except requests.RequestException as exc:
             raise SubmissionUncertain("提交连接中断，正在回查本人状态，不会自动重复提交。") from exc
+        diagnostic("http_response", channel="number", http_status=response.status_code)
         self._read_response(response, submitting=True)
 
     def submit_gps(
@@ -267,6 +285,7 @@ class CoursesClient:
             raise SubmissionUncertain(
                 "GPS 提交连接中断，正在回查本人状态，不会继续定位请求。"
             ) from exc
+        diagnostic("http_response", channel="gps", http_status=response.status_code)
         self._read_response(response, submitting=True, gps=True)
 
     def verify_attendance(self, record: Rollcall) -> bool:
