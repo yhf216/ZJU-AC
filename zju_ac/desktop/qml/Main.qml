@@ -97,6 +97,7 @@ ApplicationWindow {
             ColumnLayout { spacing: 5
                 Text { text: ["概览", "运行记录", "偏好设置"][root.page]; color: theme.text; font.pixelSize: 26; font.weight: Font.DemiBold }
                 Text { text: backend.state.date + "    /    YOUR DAILY SPACE"; color: theme.muted; font.pixelSize: 10; font.letterSpacing: 0.8 }
+                Text { objectName: "currentAccount"; visible: backend.state.account.length > 0; text: "已登录学号：" + backend.state.account; textFormat: Text.PlainText; color: theme.accent; font.pixelSize: 11 }
             }
             Item { Layout.fillWidth: true }
             Rectangle {

@@ -40,6 +40,7 @@ class DesktopBridge(QObject):
         self.context = multiprocessing.get_context("spawn")
         self.process = self.connection = self.stop_event = self.pause_event = None
         self._credentials = None
+        self._session_account = ""
         self._status, self._message = "准备就绪", ""
         self._connected = self._stopping = self._quitting = False
         self._paused = self._pause_pending = self._logged_in = False
@@ -88,6 +89,7 @@ class DesktopBridge(QObject):
             "paused": self._paused,
             "pausePending": self._pause_pending,
             "authenticated": self._logged_in,
+            "account": self._session_account if self._logged_in else "",
             "canEdit": not self._stopping
             and (
                 self.process is None
@@ -155,6 +157,7 @@ class DesktopBridge(QObject):
             if not password:
                 raise ZjuError("请输入密码，或选择已记住密码的账号。")
             self._credentials = seal_credentials(student.strip(), password)
+            self._session_account = student.strip()
             password = ""
             if not remember:
                 self.vault.forget()
@@ -225,6 +228,7 @@ class DesktopBridge(QObject):
     @Slot()
     def stopMonitor(self):
         self._clock.stop()
+        self._session_account = ""
         self._paused = self._pause_pending = self._logged_in = False
         self._restart_at = 0
         self._credentials = None

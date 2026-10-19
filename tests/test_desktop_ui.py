@@ -49,6 +49,16 @@ def test_qml_pages_and_password_clearing(application, bridge):
     assert engine.rootObjects(), warnings
     window = engine.rootObjects()[0]
     window.show()
+    account = window.findChild(QObject, "currentAccount")
+    assert not account.property("visible")
+    bridge._session_account = "test-account"
+    bridge.handle({"type": "connected"})
+    application.processEvents()
+    assert account.property("visible")
+    assert account.property("text") == "已登录学号：test-account"
+    bridge.stopMonitor()
+    application.processEvents()
+    assert not account.property("visible")
     for page in (0, 1, 2):
         window.setProperty("page", page)
         application.processEvents()
@@ -159,6 +169,27 @@ def test_network_status_recovers_after_next_successful_poll(bridge):
     bridge.handle({"type": "poll", "activities": []})
     assert bridge.state["connected"]
     assert bridge.state["status"] == "正在监控"
+
+
+def test_current_account_shown_only_for_authenticated_session(bridge, monkeypatch):
+    monkeypatch.setattr("zju_ac.desktop.bridge.seal_credentials", lambda *args: b"encrypted")
+    monkeypatch.setattr(bridge, "_spawn", Mock())
+    bridge._saved_account = "previous-account"
+    assert bridge.state["account"] == ""
+    bridge.startMonitor("  current-account  ", "password", False)
+    assert bridge.state["account"] == ""
+    bridge.handle({"type": "connected"})
+    assert bridge.state["account"] == "current-account"
+    bridge.handle({"type": "paused"})
+    bridge.forgetPassword()
+    assert bridge.state["account"] == "current-account"
+    bridge.handle({"type": "retry", "delay": 30})
+    assert bridge.state["account"] == "current-account"
+    bridge.stopMonitor()
+    assert bridge.state["account"] == ""
+    bridge.startMonitor("next-account", "password", False)
+    assert bridge.state["account"] == ""
+    assert "current-account" not in json.dumps(bridge.events)
 
 
 def test_default_theme_is_dark_and_pause_keeps_credentials_and_clock(bridge, monkeypatch):
