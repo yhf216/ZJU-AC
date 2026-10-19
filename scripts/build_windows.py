@@ -92,7 +92,7 @@ def main() -> int:
         "-m",
         "PyInstaller",
         "--noconfirm",
-        "--onedir",
+        "--onefile",
         "--windowed",
         "--noupx",
         "--name",
@@ -130,13 +130,11 @@ def main() -> int:
     environment = os.environ.copy()
     environment["PYINSTALLER_CONFIG_DIR"] = str(build / "cache")
     subprocess.run(command, cwd=ROOT, check=True, env=environment)
-    folder = ROOT / "dist/ZJU-AC"
+    executable = ROOT / "dist/ZJU-AC.exe"
     archive = ROOT / "dist/ZJU-AC-win-x64.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
-        for path in sorted(folder.rglob("*")):
-            if path.is_file():
-                bundle.write(path, path.relative_to(folder.parent))
-    print(f"\n构建完成：{folder / 'ZJU-AC.exe'}\n分发文件：{archive}")
+        bundle.write(executable, executable.name)
+    print(f"\n构建完成：{executable}\n分发文件：{archive}")
     return 0
 
 
