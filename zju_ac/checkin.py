@@ -10,7 +10,7 @@ from .client import CoursesClient, number_code
 from .config import Settings
 from .diagnostics import record as diagnostic
 from .errors import AuthenticationExpired, SubmissionUncertain, ZjuError
-from .gate import WaitingActivity, deadline_decision, evaluate_gate
+from .gate import GateDecision, WaitingActivity, deadline_decision, evaluate_gate
 from .models import SIGNED, AttendanceProgress, Rollcall
 from .notify import Notifier
 
@@ -130,11 +130,11 @@ class ConfirmedCheckin:
         current = {record.id: record for record in records}
         for rid, retry in list(self.code_retries.items()):
             latest = current.get(rid)
-            if (
-                latest is None
-                or latest.kind != "数字"
-                or latest.course_id != retry.record.course_id
-            ):
+            if latest is None:
+                # Discovery can temporarily omit a known activity. Keep the
+                # existing bounded read budget and let the server decide.
+                continue
+            if latest.kind != "数字" or latest.course_id != retry.record.course_id:
                 self.code_retries.pop(rid)
                 diagnostic("code_cancelled", activity=rid)
             else:
@@ -143,8 +143,7 @@ class ConfirmedCheckin:
                     replace(latest, ends_at=min(ends) if ends else None), retry.next_read_at
                 )
         for rid in self.automatic.keys() - live:
-            self.automatic.pop(rid)
-            print(f"[门控取消] 活动 {display(rid)} 已不在待签到列表。", flush=True)
+            diagnostic("precheck_fallback", activity=rid, stage="activity", reason="missing_record")
         for record in records:
             if record.id in self.automatic:
                 previous = self.automatic[record.id].record
@@ -156,8 +155,14 @@ class ConfirmedCheckin:
                 continue
             if record.kind in {"数字", "GPS"} and record.id not in self.asked:
                 self.asked.add(record.id)
+                diagnostic(
+                    "activity_detected",
+                    activity=record.id,
+                    channel="number" if record.kind == "数字" else "gps",
+                )
                 if record.kind == "GPS":
                     if self.settings.gps is None:
+                        diagnostic("submit_cancelled", activity=record.id, reason="no_location")
                         self._status(record, "reminder", "未选择地点，请手动处理")
                         print("未配置 GPS 地点，本活动仅提醒，请检查 config.toml。", flush=True)
                         continue
@@ -168,6 +173,7 @@ class ConfirmedCheckin:
                     self._ask(Prompt(record))
 
     def _ask(self, prompt: Prompt) -> None:
+        diagnostic("manual_prompt", activity=prompt.record.id, stage=prompt.stage)
         self._status(
             prompt.record, "confirm", "等待确认" if prompt.stage == "confirm" else "等待补码"
         )
@@ -176,7 +182,50 @@ class ConfirmedCheckin:
 
     def _status(self, record: Rollcall, stage: str, message: str) -> None:
         if self.on_status is not None:
-            self.on_status(record, stage, message)
+            try:
+                self.on_status(record, stage, message)
+            except Exception as exc:
+                diagnostic("precheck_fallback", activity=record.id, stage="display", error=exc)
+
+    def _read_before_submit(self, record: Rollcall, stage: str, reader):
+        self._guard_pause()
+        try:
+            return reader()
+        except MonitoringPaused:
+            raise
+        except Exception as exc:
+            diagnostic("precheck_fallback", activity=record.id, stage=stage, error=exc)
+            print("提交前读取信息异常，将使用已有活动信息继续尝试。", flush=True)
+            return None
+
+    def _refresh_for_submit(self, record: Rollcall) -> Rollcall:
+        reader = self.client.fresh_gps if record.kind == "GPS" else self.client.fresh_number
+        fresh = self._read_before_submit(record, "activity", lambda: reader(record))
+        if fresh is None:
+            diagnostic(
+                "precheck_fallback", activity=record.id, stage="activity", reason="missing_record"
+            )
+            return record
+        return fresh
+
+    def _already_signed(self, record: Rollcall) -> bool:
+        status = self._read_before_submit(
+            record, "own_status", lambda: self.client.my_rollcall_status(record)
+        )
+        if status in SIGNED:
+            print("本人已签到，无需重复提交。", flush=True)
+            self._result(record, "success")
+            return True
+        if status != "absent":
+            diagnostic(
+                "precheck_fallback",
+                activity=record.id,
+                stage="own_status",
+                reason="own_state_not_absent",
+                status=status,
+            )
+            print("本人状态未明确确认，将优先尝试签到提交。", flush=True)
+        return False
 
     def process(self) -> None:
         if self.pause_event is not None and self.pause_event.is_set():
@@ -200,6 +249,7 @@ class ConfirmedCheckin:
                 return
             if prompt.stage == "confirm":
                 if answer.value.lower() not in {"y", "yes"}:
+                    diagnostic("manual_decision", activity=prompt.record.id, action="cancel")
                     self._status(prompt.record, "skipped", "已跳过")
                     print(
                         f"已跳过{prompt.record.kind}签到（编号 {display(prompt.record.id)}）。",
@@ -207,6 +257,7 @@ class ConfirmedCheckin:
                     )
                     continue
                 code = None
+                diagnostic("manual_decision", activity=prompt.record.id, action="submit")
             else:
                 code = number_code(answer.value)
                 if code is None:
@@ -221,19 +272,40 @@ class ConfirmedCheckin:
             if self.pause_event is not None and self.pause_event.is_set():
                 return
             now, now_utc = time.monotonic(), datetime.now(UTC)
+            progress = None
             decision = deadline_decision(activity, policy, self.settings.gate, now, now_utc)
             if decision is None:
                 if now < activity.next_check_at:
                     continue
-                progress = self.client.attendance_progress(activity.record)
+                try:
+                    progress = self._read_before_submit(
+                        activity.record,
+                        "gate",
+                        lambda record=activity.record: self.client.attendance_progress(record),
+                    )
+                except MonitoringPaused:
+                    return
                 if isinstance(progress, AttendanceProgress) and progress.ends_at is not None:
                     activity.roster_ends_at = progress.ends_at
                 # A roster read may take time; evaluate deadlines after it finishes too.
                 now, now_utc = time.monotonic(), datetime.now(UTC)
-                decision = evaluate_gate(
-                    activity, policy, self.settings.gate, progress, now, now_utc
-                )
+                try:
+                    decision = evaluate_gate(
+                        activity, policy, self.settings.gate, progress, now, now_utc
+                    )
+                except Exception as exc:
+                    diagnostic("precheck_fallback", activity=rid, stage="gate", error=exc)
+                    decision = GateDecision("submit", "门控信息异常，优先尝试提交", "gate_error")
             print(f"[门控] 活动 {display(rid)}：{decision.reason}。", flush=True)
+            diagnostic(
+                "gate_evaluated",
+                activity=rid,
+                action=decision.action,
+                delay=max(0, int(now - activity.started_at)),
+                reason=decision.code,
+                count=progress.signed if isinstance(progress, AttendanceProgress) else None,
+                total=progress.total if isinstance(progress, AttendanceProgress) else None,
+            )
             self._status(activity.record, "waiting", decision.reason)
             if decision.action == "wait":
                 activity.next_check_at = now + policy.poll_interval_seconds
@@ -284,7 +356,13 @@ class ConfirmedCheckin:
                 {"success": "已确认成功", "failure": "未完成", "pending": "待核验"}[outcome],
             )
             diagnostic("result", activity=record.id, outcome=outcome)
-            self.notifier.result(record, outcome)
+            diagnostic("notification_requested", activity=record.id, outcome=outcome)
+            try:
+                self.notifier.result(record, outcome)
+            except Exception as exc:
+                diagnostic("notification_error", activity=record.id, error=exc)
+            else:
+                diagnostic("notification_dispatched", activity=record.id, outcome=outcome)
 
     def _process_code_retries(self) -> None:
         for rid, retry in list(self.code_retries.items()):
@@ -326,32 +404,14 @@ class ConfirmedCheckin:
 
     def _submit_number(self, record: Rollcall, code: str | None) -> None:
         self._guard_pause()
-        fresh = self.client.fresh_number(record)
-        if fresh is None:
-            print("该签到已结束、已完成或类型已变化，已取消提交。", flush=True)
-            diagnostic("code_cancelled", activity=record.id)
-            return
+        fresh = self._refresh_for_submit(record)
         ends = [end for end in (fresh.ends_at, record.ends_at) if end is not None]
         fresh = replace(fresh, ends_at=min(ends) if ends else None)
         if fresh.ends_at is not None and fresh.ends_at <= datetime.now(UTC):
             self._result(fresh, "failure")
             return
         self._guard_pause()
-        status = self.client.my_rollcall_status(fresh)
-        if status in SIGNED:
-            print("本人已签到，无需重复提交。", flush=True)
-            self._result(fresh, "success")
-            return
-        if status != "absent":
-            diagnostic(
-                "submit_cancelled",
-                activity=fresh.id,
-                channel="number",
-                reason="own_state_not_absent",
-                status=status,
-            )
-            print("本人状态不是明确的待签到状态，已取消提交。", flush=True)
-            self._result(fresh, "failure")
+        if self._already_signed(fresh):
             return
         if code is None:
             self._guard_pause()
@@ -360,16 +420,21 @@ class ConfirmedCheckin:
                 return
             self.code_reads[record.id] = self.code_reads.get(record.id, 0) + 1
             diagnostic("code_read", activity=record.id, attempt=self.code_reads[record.id])
-            code = self.client.read_number_code(fresh)
+            code = self._read_before_submit(
+                fresh, "code", lambda: self.client.read_number_code(fresh)
+            )
             if code is None:
                 self._missing_code(fresh)
                 return
+        diagnostic("code_available", activity=fresh.id, channel="number")
         # Code lookup or manual input can take time; check activity again just before PUT.
         self._guard_pause()
-        if (
-            fresh.ends_at is not None and fresh.ends_at <= datetime.now(UTC)
-        ) or self.client.fresh_number(fresh) is None:
-            print("提交前活动已结束或已完成，已取消提交。", flush=True)
+        latest = self._refresh_for_submit(fresh)
+        ends = [end for end in (fresh.ends_at, latest.ends_at) if end is not None]
+        fresh = replace(fresh, ends_at=min(ends) if ends else None)
+        if fresh.ends_at is not None and fresh.ends_at <= datetime.now(UTC):
+            diagnostic("submit_cancelled", activity=fresh.id, reason="expired")
+            print("活动已明确截止，无法继续提交。", flush=True)
             return
         try:
             self._guard_pause()
@@ -378,9 +443,16 @@ class ConfirmedCheckin:
             self._status(fresh, "submitting", "正在提交")
             diagnostic("submit_started", activity=fresh.id, channel="number")
             self.client.submit_number(fresh, code)
+        except MonitoringPaused:
+            raise
         except SubmissionUncertain as exc:
             diagnostic("submit_uncertain", activity=fresh.id, error=exc)
             print(str(exc), flush=True)
+        except ZjuError:
+            raise
+        except Exception as exc:
+            diagnostic("submit_uncertain", activity=fresh.id, error=exc)
+            print("提交过程异常，正在回查本人状态。", flush=True)
         self._verify(fresh)
 
     def _submit_gps(self, record: Rollcall) -> None:
@@ -389,26 +461,9 @@ class ConfirmedCheckin:
         if location is None:
             print("未配置 GPS 地点，已取消提交。", flush=True)
             return
-        fresh = self.client.fresh_gps(record)
-        if fresh is None:
-            print("GPS 活动已结束、已完成或类型已变化，已取消后续定位请求。", flush=True)
-            return
+        fresh = self._refresh_for_submit(record)
         self._guard_pause()
-        status = self.client.my_rollcall_status(fresh)
-        if status in SIGNED:
-            print("本人已签到，无需继续定位请求。", flush=True)
-            self._result(fresh, "success")
-            return
-        if status != "absent":
-            diagnostic(
-                "submit_cancelled",
-                activity=fresh.id,
-                channel="gps",
-                reason="own_state_not_absent",
-                status=status,
-            )
-            print("本人状态不是明确的待签到状态，已取消后续定位请求。", flush=True)
-            self._result(fresh, "failure")
+        if self._already_signed(fresh):
             return
         try:
             self._guard_pause()
@@ -417,12 +472,20 @@ class ConfirmedCheckin:
             self._status(fresh, "submitting", "正在提交")
             diagnostic("submit_started", activity=fresh.id, channel="gps")
             self.client.submit_gps(fresh, location.coordinates, accuracy=location.accuracy)
+        except MonitoringPaused:
+            raise
         except SubmissionUncertain as exc:
             diagnostic("submit_uncertain", activity=fresh.id, error=exc)
             print(str(exc), flush=True)
+        except ZjuError:
+            raise
+        except Exception as exc:
+            diagnostic("submit_uncertain", activity=fresh.id, error=exc)
+            print("提交过程异常，正在回查本人状态。", flush=True)
         self._verify(fresh)
 
     def _verify(self, fresh: Rollcall) -> None:
+        diagnostic("verification_started", activity=fresh.id)
         try:
             verified = self.client.verify_attendance(fresh)
         except AuthenticationExpired as exc:
@@ -430,10 +493,10 @@ class ConfirmedCheckin:
             self._result(fresh, "pending")
             print("[待核验] 提交后会话失效，请在畅课中查看签到结果。", flush=True)
             raise
-        except ZjuError as exc:
+        except Exception as exc:
             diagnostic("verification_error", activity=fresh.id, error=exc)
             self._result(fresh, "pending")
-            print(f"[待核验] 无法回查本人状态：{exc} 不会自动重复提交。", flush=True)
+            print("[待核验] 无法回查本人状态，不会自动重复提交。", flush=True)
             return
         if verified:
             self._result(fresh, "success")

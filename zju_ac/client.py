@@ -149,8 +149,8 @@ class CoursesClient:
             return attendance_progress(self.get_json(f"/api/rollcall/{rid}/student_rollcalls"))
         except (PermissionDenied, ProtocolError, TemporaryError) as exc:
             diagnostic("channel_error", channel="detail", error=exc)
-            # Per user policy, unavailable roster data releases only the gate.
-            # Activity and own attendance still must be checked before submission.
+            # Unavailable roster data releases the gate; submission uses the
+            # controller's best-effort prechecks and still verifies afterwards.
             return None
 
     def fresh_number(self, record: Rollcall) -> Rollcall | None:
@@ -177,9 +177,10 @@ class CoursesClient:
         try:
             detail = self.get_json(f"/api/rollcall/{rid}/student_rollcalls")
             if isinstance(detail, dict) and (code := number_code(detail.get("number_code"))):
+                diagnostic("code_available", activity=rid, channel="detail")
                 LOGGER.info("数字码已从点名详情通道获取（活动 %s）。", rid)
                 return code
-        except (PermissionDenied, ProtocolError, TemporaryError) as exc:
+        except Exception as exc:
             diagnostic("channel_error", channel="detail", error=exc)
             LOGGER.warning("点名详情取码通道不可用，尝试课表日期通道（活动 %s）。", rid)
         if record.course_id is None or record.started_at is None:
@@ -192,7 +193,7 @@ class CoursesClient:
                     "rollcall_date": record.started_at.astimezone(UTC).date().isoformat(),
                 },
             )
-        except (PermissionDenied, ProtocolError, TemporaryError) as exc:
+        except Exception as exc:
             diagnostic("channel_error", channel="timetable", error=exc)
             LOGGER.warning("课表日期取码通道不可用（活动 %s）。", rid)
             return None
@@ -203,6 +204,7 @@ class CoursesClient:
             if isinstance(item, dict) and str(item.get("id")) == rid:
                 code = number_code(item.get("number_code"))
                 if code is not None:
+                    diagnostic("code_available", activity=rid, channel="timetable")
                     LOGGER.info("数字码已从课表日期通道获取（活动 %s）。", rid)
                 return code
         return None

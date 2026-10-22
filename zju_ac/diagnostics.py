@@ -40,6 +40,15 @@ EVENTS = {
     "worker_exit",
     "worker_error",
     "notification_error",
+    "activity_detected",
+    "manual_prompt",
+    "manual_decision",
+    "gate_evaluated",
+    "precheck_fallback",
+    "code_available",
+    "verification_started",
+    "notification_requested",
+    "notification_dispatched",
 }
 CHANNELS = {"profile", "discovery", "detail", "timetable", "own_status", "number", "gps"}
 OUTCOMES = {"success", "failure", "pending"}
@@ -74,19 +83,27 @@ class Recorder:
         attempt: int | None = None,
         delay: int | None = None,
         count: int | None = None,
+        total: int | None = None,
         channel: str | None = None,
         http_status: int | None = None,
         outcome: str | None = None,
         source: str | None = None,
         reason: str | None = None,
         status: str | None = None,
+        stage: str | None = None,
+        action: str | None = None,
     ) -> None:
         if event not in EVENTS:
             return
         data = {"time": datetime.now(UTC).isoformat(), "event": event, "version": __version__}
         if activity is not None:
             data["activity"] = hashlib.sha256((self.salt + activity).encode()).hexdigest()[:12]
-        for key, value in (("attempt", attempt), ("delay", delay), ("count", count)):
+        for key, value in (
+            ("attempt", attempt),
+            ("delay", delay),
+            ("count", count),
+            ("total", total),
+        ):
             if type(value) is int and 0 <= value <= 1000000:
                 data[key] = value
         if channel in CHANNELS:
@@ -104,9 +121,22 @@ class Recorder:
             "unsupported_shape",
             "conflicting_records",
             "own_state_not_absent",
+            "expired",
+            "immediate",
+            "max_wait",
+            "ending",
+            "no_roster",
+            "threshold_met",
+            "threshold_wait",
+            "gate_error",
+            "no_location",
         }:
             data["reason"] = reason
-        if event in {"own_status", "submit_cancelled"}:
+        if stage in {"confirm", "code", "display", "activity", "own_status", "gate"}:
+            data["stage"] = stage
+        if action in {"submit", "wait", "cancel"}:
+            data["action"] = action
+        if event in {"own_status", "submit_cancelled", "precheck_fallback"}:
             data["status"] = (
                 status
                 if status in {"absent", "on_call", "on_call_fine", "on_personal_leave"}

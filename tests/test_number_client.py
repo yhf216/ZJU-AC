@@ -5,7 +5,7 @@ import pytest
 import requests
 
 from zju_ac.client import BASE_URL, CoursesClient, number_code
-from zju_ac.errors import AuthenticationExpired, CheckinRejected, ProtocolError, SubmissionUncertain
+from zju_ac.errors import CheckinRejected, ProtocolError, SubmissionUncertain
 from zju_ac.models import Rollcall
 
 RECORD = Rollcall(
@@ -231,17 +231,32 @@ def test_course_record_can_use_nested_rollcall_id_and_normalized_personal_status
     assert client.get_json.call_count == 1
 
 
-def test_automatic_number_checkin_with_history_omission_and_dual_code_channels(capsys):
+@pytest.mark.parametrize("failure", [None, "gate", "activity", "own_status"])
+def test_automatic_number_checkin_with_history_omission_and_dual_code_channels(
+    capsys, monkeypatch, tmp_path, request, failure
+):
+    import json
+
+    from zju_ac import diagnostics
     from zju_ac.checkin import ConfirmedCheckin
     from zju_ac.config import Settings
 
     session, prompts, notifier = Mock(), Mock(), Mock()
-    state = {"status": "absent"}
+    state = {"status": "absent", "radar_reads": 0, "detail_reads": 0, "own_reads": 0}
+    recorder = diagnostics.Recorder(tmp_path)
+    request.addfinalizer(recorder.close)
+    monkeypatch.setattr(diagnostics, "_recorder", recorder)
+    monkeypatch.setattr(
+        requests.Session, "request", Mock(side_effect=AssertionError("network forbidden"))
+    )
 
     def get(url, **kwargs):
         if url.endswith("/api/profile"):
             return json_response({"id": 99})
         if url.endswith("/api/radar/rollcalls"):
+            state["radar_reads"] += 1
+            if failure == "activity" and state["status"] == "absent" and state["radar_reads"] > 1:
+                raise RuntimeError("private-read-error")
             return json_response(
                 {
                     "rollcalls": [
@@ -257,6 +272,9 @@ def test_automatic_number_checkin_with_history_omission_and_dual_code_channels(c
                 }
             )
         if url.endswith("/api/rollcall/42/student_rollcalls"):
+            state["detail_reads"] += 1
+            if failure == "gate" and state["detail_reads"] == 1:
+                raise RuntimeError("private-read-error")
             return json_response(
                 {
                     "number_code": None,
@@ -269,6 +287,9 @@ def test_automatic_number_checkin_with_history_omission_and_dual_code_channels(c
         if url.endswith("/api/timetable_rollcalls"):
             return json_response({"rollcalls": [{"id": 42, "number_code": "0123"}]})
         assert url.endswith("/api/course/7/student/99/rollcalls")
+        state["own_reads"] += 1
+        if failure == "own_status" and state["own_reads"] == 1:
+            raise RuntimeError("private-read-error")
         return json_response({"rollcalls": []})
 
     def put(url, **kwargs):
@@ -290,6 +311,35 @@ def test_automatic_number_checkin_with_history_omission_and_dual_code_channels(c
     assert state["status"] == "on_call_fine"
     assert notifier.result.call_args.args[1] == "success"
     assert "签到成功" in capsys.readouterr().out
+    entries = [json.loads(line) for line in recorder.path.read_text("utf-8").splitlines()]
+    events = [entry["event"] for entry in entries]
+    stages = [
+        "activity_detected",
+        "gate_evaluated",
+        "code_available",
+        "submit_started",
+        "verification_started",
+        "result",
+        "notification_requested",
+        "notification_dispatched",
+    ]
+    assert [events.index(stage) for stage in stages] == sorted(
+        events.index(stage) for stage in stages
+    )
+    if failure:
+        assert any(
+            entry.get("stage") == failure
+            for entry in entries
+            if entry["event"] == "precheck_fallback"
+        )
+    bundle = diagnostics.export_bundle(tmp_path)
+    from zipfile import ZipFile
+
+    with ZipFile(bundle) as exported:
+        text = exported.read(recorder.path.name).decode("utf-8")
+        assert "private-read-error" not in text
+        assert "0123" not in text
+        assert "deviceId" not in text
 
 
 def test_freshness_check_rejects_type_or_course_changes():
@@ -340,12 +390,12 @@ def test_both_channels_temporarily_unavailable_allow_manual_input():
     session.put.assert_not_called()
 
 
-def test_expired_session_does_not_fall_back_or_prompt_for_code():
+def test_expired_code_channel_tries_both_reads_without_guessing_or_writing():
     session = Mock()
     session.get.return_value = json_response({}, 401)
-    with pytest.raises(AuthenticationExpired):
-        CoursesClient(session).read_number_code(RECORD)
-    session.get.assert_called_once()
+    assert CoursesClient(session).read_number_code(RECORD) is None
+    assert session.get.call_count == 2
+    session.put.assert_not_called()
 
 
 def test_missing_detail_code_falls_back_but_wrong_activity_never_supplies_code():

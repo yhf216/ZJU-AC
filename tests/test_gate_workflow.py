@@ -138,7 +138,7 @@ def test_first_detection_timer_is_not_reset_on_each_poll(workflow):
     client.submit_number.assert_called_once()
 
 
-def test_disappearing_activity_cancels_pending_gate(workflow):
+def test_disappearing_activity_keeps_gate_and_eventually_attempts_submission(workflow):
     client, _, checkin, clock = workflow
     checkin.observe([NUMBER])
     checkin.process()
@@ -146,7 +146,7 @@ def test_disappearing_activity_cancels_pending_gate(workflow):
     clock[0] = 130
     checkin.process()
     assert not checkin.automatic
-    client.submit_number.assert_not_called()
+    client.submit_number.assert_called_once()
 
 
 def test_activity_expiring_while_waiting_cancels_instead_of_using_fallback(workflow):
@@ -178,25 +178,26 @@ def test_roster_unavailable_fallback_still_checks_own_status(workflow, own_statu
     client.my_rollcall_status.return_value = own_status
     checkin.observe([NUMBER])
     checkin.process()
-    client.submit_number.assert_not_called()
+    assert client.submit_number.call_count == (
+        0 if own_status in {"on_call", "on_call_fine"} else 1
+    )
 
 
-def test_roster_unavailable_fallback_still_checks_activity(workflow):
+def test_roster_and_fresh_activity_unavailable_still_attempts_submission(workflow):
     client, _, checkin, _ = workflow
     client.attendance_progress.return_value = None
     client.fresh_number.return_value = None
     checkin.observe([NUMBER])
     checkin.process()
-    client.submit_number.assert_not_called()
+    client.submit_number.assert_called_once()
 
 
-def test_session_expiry_during_gate_wait_propagates_for_login_recovery(workflow):
+def test_session_error_in_gate_does_not_cancel_submission_attempt(workflow):
     client, _, checkin, _ = workflow
     client.attendance_progress.side_effect = AuthenticationExpired("expired")
     checkin.observe([NUMBER])
-    with pytest.raises(AuthenticationExpired):
-        checkin.process()
-    client.submit_number.assert_not_called()
+    checkin.process()
+    client.submit_number.assert_called_once()
 
 
 def test_manual_confirmation_does_not_query_roster_or_wait_for_gate(workflow):

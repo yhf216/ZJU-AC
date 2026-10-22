@@ -109,13 +109,11 @@ def test_write_errors_never_schedule_reads_or_repeat_submission(workflow, error)
     )
 
 
-@pytest.mark.parametrize("change", [None, "course", "kind", "expired", "close"])
+@pytest.mark.parametrize("change", ["course", "kind", "expired", "close"])
 def test_cancelled_retry_does_not_read_again(workflow, change):
     checkin, client, _, clock = workflow
     checkin.process()
-    if change is None:
-        checkin.observe([])
-    elif change == "course":
+    if change == "course":
         checkin.observe([replace(RECORD, course_id="8")])
     elif change == "kind":
         checkin.observe([replace(RECORD, kind="GPS")])
@@ -126,6 +124,16 @@ def test_cancelled_retry_does_not_read_again(workflow, change):
     clock[0] = 30
     checkin.process()
     client.read_number_code.assert_called_once()
+    client.submit_number.assert_not_called()
+
+
+def test_missing_discovery_record_keeps_bounded_code_retry(workflow):
+    checkin, client, _, clock = workflow
+    checkin.process()
+    checkin.observe([])
+    clock[0] = 30
+    checkin.process()
+    assert client.read_number_code.call_count == 2
     client.submit_number.assert_not_called()
 
 

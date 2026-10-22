@@ -26,6 +26,7 @@ class WaitingActivity:
 class GateDecision:
     action: str
     reason: str
+    code: str = ""
 
 
 def deadline_decision(
@@ -39,13 +40,17 @@ def deadline_decision(
         raise ZjuError("自动签到门控尚未支持此条件，请修改 config.toml。")
     remaining = (activity.ends_at - now_utc).total_seconds() if activity.ends_at else None
     if remaining is not None and remaining <= 0:
-        return GateDecision("cancel", "签到已结束，取消等待")
+        return GateDecision("cancel", "签到已结束，取消等待", "expired")
     if mode == "immediate":
-        return GateDecision("submit", "已配置直接签到")
+        return GateDecision("submit", "已配置直接签到", "immediate")
     if now - activity.started_at >= settings.max_wait_seconds:
-        return GateDecision("submit", f"等待达到 {settings.max_wait_seconds} 秒，保底放行")
+        return GateDecision(
+            "submit", f"等待达到 {settings.max_wait_seconds} 秒，保底放行", "max_wait"
+        )
     if remaining is not None and remaining <= settings.min_remaining_seconds:
-        return GateDecision("submit", f"距结束不超过 {settings.min_remaining_seconds} 秒，保底放行")
+        return GateDecision(
+            "submit", f"距结束不超过 {settings.min_remaining_seconds} 秒，保底放行", "ending"
+        )
     return None
 
 
@@ -69,11 +74,11 @@ def evaluate_gate(
         or progress.total <= 0
         or not 0 <= progress.signed <= progress.total
     ):
-        return GateDecision("submit", "拿不到有效完整名单，保底放行")
+        return GateDecision("submit", "拿不到有效完整名单，保底放行", "no_roster")
     ratio_met = Decimal(progress.signed) > Decimal(progress.total) * Decimal(
         str(settings.signed_ratio)
     )
     counts = f"已签 {progress.signed}/{progress.total}"
     if ratio_met or progress.signed > settings.signed_count:
-        return GateDecision("submit", f"{counts}，人数门控达标")
-    return GateDecision("wait", f"{counts}，未超过比例或人数阈值，继续等待")
+        return GateDecision("submit", f"{counts}，人数门控达标", "threshold_met")
+    return GateDecision("wait", f"{counts}，未超过比例或人数阈值，继续等待", "threshold_wait")

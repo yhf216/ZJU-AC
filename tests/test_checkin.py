@@ -112,15 +112,15 @@ def test_manual_code_can_be_cancelled(workflow):
     client.submit_number.assert_not_called()
 
 
-def test_activity_expires_while_waiting_for_confirmation(workflow):
+def test_missing_active_record_still_attempts_confirmed_submission(workflow):
     client, prompts, checkin = workflow
     client.fresh_number.return_value = None
     prompts.reply("y")
     checkin.process()
-    client.submit_number.assert_not_called()
+    client.submit_number.assert_called_once()
 
 
-def test_activity_expires_while_waiting_for_manual_code(workflow):
+def test_missing_active_record_after_manual_code_still_attempts_submission(workflow):
     client, prompts, checkin = workflow
     client.read_number_code.return_value = None
     prompts.reply("y")
@@ -128,18 +128,18 @@ def test_activity_expires_while_waiting_for_manual_code(workflow):
     client.fresh_number.return_value = None
     prompts.reply("0123")
     checkin.process()
-    client.submit_number.assert_not_called()
+    client.submit_number.assert_called_once()
 
 
 @pytest.mark.parametrize(
     "status", [None, "on_call", "on_call_fine", "on_personal_leave", "unknown"]
 )
-def test_missing_or_completed_personal_record_prevents_write(workflow, status):
+def test_only_confirmed_signed_status_prevents_duplicate_write(workflow, status):
     client, prompts, checkin = workflow
     client.my_rollcall_status.return_value = status
     prompts.reply("y")
     checkin.process()
-    client.submit_number.assert_not_called()
+    assert client.submit_number.call_count == (0 if status in {"on_call", "on_call_fine"} else 1)
 
 
 def test_write_timeout_only_verifies_and_never_retries(workflow, capsys):
@@ -181,12 +181,41 @@ def test_rejected_code_does_not_stop_monitor_or_retry(workflow, capsys):
     client.verify_attendance.assert_not_called()
 
 
-def test_expired_session_propagates_to_main(workflow):
+def test_precheck_authentication_error_does_not_cancel_confirmed_attempt(workflow):
     client, prompts, checkin = workflow
     client.fresh_number.side_effect = AuthenticationExpired("expired")
     prompts.reply("y")
-    with pytest.raises(AuthenticationExpired):
-        checkin.process()
+    checkin.process()
+    client.submit_number.assert_called_once()
+
+
+@pytest.mark.parametrize("reader", ["fresh_number", "my_rollcall_status"])
+@pytest.mark.parametrize("error", [TemporaryError("offline"), RuntimeError("private-read-error")])
+def test_read_errors_still_attempt_confirmed_number_submission(workflow, reader, error):
+    client, prompts, checkin = workflow
+    getattr(client, reader).side_effect = error
+    prompts.reply("y")
+    checkin.process()
+    client.submit_number.assert_called_once()
+    client.verify_attendance.assert_called_once()
+
+
+def test_unexpected_write_error_verifies_without_repeating_submission(workflow):
+    client, prompts, checkin = workflow
+    client.submit_number.side_effect = RuntimeError("private-write-error")
+    prompts.reply("y")
+    checkin.process()
+    checkin.process()
+    client.submit_number.assert_called_once()
+    client.verify_attendance.assert_called_once()
+
+
+def test_ui_status_callback_error_does_not_interrupt_submission(workflow):
+    client, prompts, checkin = workflow
+    checkin.on_status = Mock(side_effect=RuntimeError("private-ui-error"))
+    prompts.reply("y")
+    checkin.process()
+    client.submit_number.assert_called_once()
 
 
 def test_eof_cancels_pending_decisions(workflow):
@@ -232,12 +261,12 @@ def test_untrusted_course_text_cannot_control_terminal():
     assert "\n" not in prompt.message()
 
 
-def test_activity_closes_during_automatic_code_lookup(workflow):
+def test_active_record_disappearing_during_code_lookup_still_attempts_submission(workflow):
     client, prompts, checkin = workflow
     client.fresh_number.side_effect = [RECORD, None]
     prompts.reply("y")
     checkin.process()
-    client.submit_number.assert_not_called()
+    client.submit_number.assert_called_once()
 
 
 @pytest.mark.parametrize("kind", ["数字", "GPS"])
@@ -340,23 +369,23 @@ def test_gps_range_rejection_without_distance_stops_but_monitor_remains_active(g
     assert not checkin.closed
 
 
-def test_gps_expired_while_user_waited_does_not_submit(gps_workflow):
+def test_gps_missing_active_record_still_submits_selected_location(gps_workflow):
     client, prompts, checkin = gps_workflow
     client.fresh_gps.return_value = None
     prompts.reply("y")
     checkin.process()
-    client.submit_gps.assert_not_called()
+    client.submit_gps.assert_called_once()
 
 
 @pytest.mark.parametrize(
     "status", [None, "on_call", "on_call_fine", "on_personal_leave", "unknown"]
 )
-def test_gps_own_state_must_be_absent(gps_workflow, status):
+def test_gps_unknown_state_continues_but_signed_state_does_not_repeat(gps_workflow, status):
     client, prompts, checkin = gps_workflow
     client.my_rollcall_status.return_value = status
     prompts.reply("y")
     checkin.process()
-    client.submit_gps.assert_not_called()
+    assert client.submit_gps.call_count == (0 if status in {"on_call", "on_call_fine"} else 1)
 
 
 def test_gps_200_without_own_success_is_pending(gps_workflow, capsys):
