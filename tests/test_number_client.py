@@ -171,6 +171,127 @@ def test_absence_from_active_list_does_not_count_as_success(monkeypatch):
     assert not client.verify_attendance(RECORD)
 
 
+@pytest.mark.parametrize(
+    "status", ["absent", "on_call_fine", "on_personal_leave", None, "new-state"]
+)
+def test_missing_course_history_uses_fresh_personal_discovery_status(status):
+    client = CoursesClient(Mock())
+    client._student_id = "99"
+    client.get_json = Mock(
+        side_effect=[
+            {"rollcalls": [{"id": 123, "status": "absent"}]},
+            {
+                "rollcalls": [
+                    {
+                        "rollcall_id": 42,
+                        "course_id": 7,
+                        "status": status,
+                        "rollcall_status": "in_progress",
+                    }
+                ]
+            },
+        ]
+    )
+    assert client.my_rollcall_status(RECORD) == status
+    assert client.get_json.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [{"rollcall_id": 42, "course_id": 8, "status": "absent"}],
+        [{"rollcall_id": 43, "course_id": 7, "status": "absent"}],
+        [{"rollcall_id": 42, "course_id": 7, "rollcall_status": "absent"}],
+        [
+            {"rollcall_id": 42, "course_id": 7, "status": "absent"},
+            {"rollcall_id": 42, "course_id": 7, "status": "on_call_fine"},
+        ],
+    ],
+)
+def test_discovery_fallback_does_not_guess_from_other_courses_or_activity_status(items):
+    client = CoursesClient(Mock())
+    client._student_id = "99"
+    client.get_json = Mock(side_effect=[{"rollcalls": []}, {"rollcalls": items}])
+    assert client.my_rollcall_status(RECORD) is None
+
+
+def test_course_record_can_use_nested_rollcall_id_and_normalized_personal_status():
+    client = CoursesClient(Mock())
+    client._student_id = "99"
+    client.get_json = Mock(
+        return_value={
+            "data": {
+                "rollcalls": [
+                    {"id": 9001, "rollcall": {"id": 42}, "status": " ABSENT "},
+                ]
+            }
+        }
+    )
+    assert client.my_rollcall_status(RECORD) == "absent"
+    assert client.get_json.call_count == 1
+
+
+def test_automatic_number_checkin_with_history_omission_and_dual_code_channels(capsys):
+    from zju_ac.checkin import ConfirmedCheckin
+    from zju_ac.config import Settings
+
+    session, prompts, notifier = Mock(), Mock(), Mock()
+    state = {"status": "absent"}
+
+    def get(url, **kwargs):
+        if url.endswith("/api/profile"):
+            return json_response({"id": 99})
+        if url.endswith("/api/radar/rollcalls"):
+            return json_response(
+                {
+                    "rollcalls": [
+                        {
+                            "id": 42,
+                            "course_id": 7,
+                            "is_number": True,
+                            "status": state["status"],
+                            "rollcall_status": "in_progress",
+                            "rollcall_time": "2026-10-22T02:45:00Z",
+                        }
+                    ]
+                }
+            )
+        if url.endswith("/api/rollcall/42/student_rollcalls"):
+            return json_response(
+                {
+                    "number_code": None,
+                    "student_rollcalls": [
+                        {"rollcall_status": "on_call_fine" if n < 21 else "absent"}
+                        for n in range(80)
+                    ],
+                }
+            )
+        if url.endswith("/api/timetable_rollcalls"):
+            return json_response({"rollcalls": [{"id": 42, "number_code": "0123"}]})
+        assert url.endswith("/api/course/7/student/99/rollcalls")
+        return json_response({"rollcalls": []})
+
+    def put(url, **kwargs):
+        assert url.endswith("/api/rollcall/42/answer_number_rollcall")
+        assert kwargs["json"]["numberCode"] == "0123"
+        state["status"] = "on_call_fine"
+        return json_response({})
+
+    session.get.side_effect, session.put.side_effect = get, put
+    prompts.poll.return_value = []
+    client = CoursesClient(session)
+    checkin = ConfirmedCheckin(
+        client, prompts, notifier=notifier, settings=Settings(auto_checkin=True)
+    )
+    checkin.observe(client.rollcalls())
+    checkin.process()
+    checkin.process()
+    assert session.put.call_count == 1
+    assert state["status"] == "on_call_fine"
+    assert notifier.result.call_args.args[1] == "success"
+    assert "签到成功" in capsys.readouterr().out
+
+
 def test_freshness_check_rejects_type_or_course_changes():
     client = CoursesClient(Mock())
     client.rollcalls = Mock(return_value=[Rollcall("42", "课程", "签到", "GPS", course_id="7")])

@@ -29,6 +29,8 @@ EVENTS = {
     "code_cancelled",
     "channel_error",
     "http_response",
+    "own_status",
+    "submit_cancelled",
     "network_error",
     "submit_started",
     "submit_uncertain",
@@ -75,6 +77,9 @@ class Recorder:
         channel: str | None = None,
         http_status: int | None = None,
         outcome: str | None = None,
+        source: str | None = None,
+        reason: str | None = None,
+        status: str | None = None,
     ) -> None:
         if event not in EVENTS:
             return
@@ -90,6 +95,25 @@ class Recorder:
             data["http_status"] = http_status
         if outcome in OUTCOMES:
             data["outcome"] = outcome
+        if source in {"course", "radar"}:
+            data["source"] = source
+        if reason in {
+            "matched",
+            "missing_record",
+            "missing_status",
+            "unsupported_shape",
+            "conflicting_records",
+            "own_state_not_absent",
+        }:
+            data["reason"] = reason
+        if event in {"own_status", "submit_cancelled"}:
+            data["status"] = (
+                status
+                if status in {"absent", "on_call", "on_call_fine", "on_personal_leave"}
+                else "missing"
+                if status is None
+                else "unknown"
+            )
         if error is not None:
             chain, visited = [], set()
             while error is not None and id(error) not in visited and len(chain) < 5:

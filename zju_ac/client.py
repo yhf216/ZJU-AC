@@ -212,24 +212,70 @@ class CoursesClient:
         if self._student_id is None:
             self.profile()
         path = f"/api/course/{cid}/student/{self._student_id}/rollcalls"
-        # Query only this student's records; stop rather than guess if not found.
+        # Some deployments omit the active record from course history. In that
+        # case read the live discovery response, whose status is also personal.
         for page in range(1, 6):
             payload = self.get_json(path, params={"page": page, "page_size": 100})
             if isinstance(payload, list):
                 items = payload
             elif isinstance(payload, dict):
                 items = payload.get("rollcalls", payload.get("data"))
+                if isinstance(items, dict):
+                    items = items.get("rollcalls")
             else:
                 items = None
             if not isinstance(items, list):
-                raise ProtocolError("本人签到记录响应格式改变，无法核验结果。")
-            for item in items:
-                if isinstance(item, dict) and str(item.get("rollcall_id") or item.get("id")) == rid:
-                    status = item.get("status")
-                    return status if isinstance(status, str) else None
+                diagnostic("own_status", source="course", reason="unsupported_shape")
+                break
+            matches = [item for item in items if self._matches_rollcall(item, rid)]
+            if matches:
+                status = self._personal_status(matches, record, "course")
+                if status is not None:
+                    return status
+                # Missing fields can be recovered through discovery; conflicting
+                # explicit personal states must not become permission to submit.
+                if any(isinstance(item.get("status"), str) for item in matches):
+                    return None
             if len(items) < 100:
                 break
-        return None
+        diagnostic("own_status", source="course", reason="missing_record", activity=rid)
+        payload = self.get_json("/api/radar/rollcalls")
+        items = payload.get("rollcalls") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            diagnostic("own_status", source="radar", reason="unsupported_shape", activity=rid)
+            return None
+        matches = [
+            item
+            for item in items
+            if self._matches_rollcall(item, rid) and str(item.get("course_id")) == cid
+        ]
+        return self._personal_status(matches, record, "radar")
+
+    @staticmethod
+    def _matches_rollcall(item: Any, rid: str) -> bool:
+        if not isinstance(item, dict):
+            return False
+        nested = item.get("rollcall")
+        identifier = item.get("rollcall_id")
+        if identifier is None and isinstance(nested, dict):
+            identifier = nested.get("id")
+        if identifier is None:
+            identifier = item.get("id")
+        return not isinstance(identifier, bool) and str(identifier) == rid
+
+    @staticmethod
+    def _personal_status(items: list[dict], record: Rollcall, source: str) -> str | None:
+        statuses = [
+            item["status"].strip().lower()
+            for item in items
+            if isinstance(item.get("status"), str) and item["status"].strip()
+        ]
+        reason = "matched" if statuses else "missing_status" if items else "missing_record"
+        if len(set(statuses)) > 1:
+            reason = "conflicting_records"
+        status = statuses[0] if statuses and reason == "matched" else None
+        diagnostic("own_status", activity=record.id, source=source, reason=reason, status=status)
+        return status
 
     def submit_number(self, record: Rollcall, code: str) -> None:
         rid = api_id(record.id)

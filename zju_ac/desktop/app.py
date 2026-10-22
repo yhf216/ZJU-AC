@@ -13,7 +13,12 @@ def main() -> int:
         from .worker import smoke_test
 
         return smoke_test(Path(os.environ["ZJU_AC_SMOKE_DIR"]))
-    from PySide6.QtCore import QMetaObject, QObject, QTimer, QUrl
+    from .storage import ConfigStore, default_directory
+
+    smoke = "--smoke-test" in sys.argv
+    directory = Path(os.environ["ZJU_AC_SMOKE_DIR"]) if smoke else default_directory()
+    os.environ["QML_DISK_CACHE_PATH"] = str(directory / "cache/qml")
+    from PySide6.QtCore import QMetaObject, QObject, Qt, QTimer, QUrl
     from PySide6.QtGui import QAction, QFont, QFontDatabase, QIcon
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtQml import QQmlApplicationEngine
@@ -21,9 +26,8 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
     from .bridge import DesktopBridge
-    from .storage import ConfigStore, default_directory
 
-    smoke = "--smoke-test" in sys.argv
+    QApplication.setAttribute(Qt.AA_DisableShaderDiskCache)
     app = QApplication([sys.argv[0]])
     if os.name == "nt" and os.environ.get("QT_QPA_PLATFORM") == "offscreen":
         fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
@@ -37,7 +41,6 @@ def main() -> int:
     root = Path(__file__).resolve().parent
     icon = QIcon(str(root / "assets/mark.svg"))
     app.setWindowIcon(icon)
-    directory = Path(os.environ["ZJU_AC_SMOKE_DIR"]) if smoke else default_directory()
     server = None
     if not smoke:
         server_name = "zju-ac-" + hashlib.sha256(str(directory).encode()).hexdigest()[:16]
@@ -61,7 +64,12 @@ def main() -> int:
 
         setup(directory / "logs")
         report_error("config_error", exc)
-        QMessageBox.critical(None, "ZJU-AC", "无法读取设置，请检查用户数据目录中的 config.toml。")
+        QMessageBox.critical(
+            None,
+            "ZJU-AC",
+            "无法读写安装目录下的 data 文件夹。"
+            "请检查 data/config.toml，或选择有写入权限的安装目录。",
+        )
         return 1
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("backend", bridge)

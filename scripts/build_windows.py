@@ -1,14 +1,29 @@
-"""Build the Windows portable application using the current Python environment."""
+"""Build the Windows application and its Inno Setup installer."""
 
 import os
+import shutil
 import struct
 import subprocess
 import sys
 import tomllib
-import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def find_compiler() -> Path:
+    candidates = [
+        os.environ.get("INNO_SETUP_COMPILER"),
+        shutil.which("ISCC.exe"),
+        ROOT / "build/tools/inno/ISCC.exe",
+    ]
+    for variable in ("ProgramFiles(x86)", "ProgramFiles"):
+        if directory := os.environ.get(variable):
+            candidates.extend(Path(directory) / f"Inno Setup {v}/ISCC.exe" for v in (6, 7))
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return Path(candidate).resolve()
+    raise SystemExit("请安装 Inno Setup 6.7+，或设置 INNO_SETUP_COMPILER 为 ISCC.exe 的路径。")
 
 
 def make_icon(target: Path) -> None:
@@ -40,6 +55,7 @@ def make_icon(target: Path) -> None:
 def main() -> int:
     if sys.platform != "win32":
         raise SystemExit("请在 Windows 的 Python 3.12 环境中运行。")
+    compiler = find_compiler()
     build = ROOT / "build/windows"
     build.mkdir(parents=True, exist_ok=True)
     icon = build / "app.ico"
@@ -92,7 +108,7 @@ def main() -> int:
         "-m",
         "PyInstaller",
         "--noconfirm",
-        "--onefile",
+        "--onedir",
         "--windowed",
         "--noupx",
         "--name",
@@ -102,7 +118,7 @@ def main() -> int:
         "--version-file",
         str(version_file),
         "--distpath",
-        str(ROOT / "dist"),
+        str(build / "payload"),
         "--workpath",
         str(build / "work"),
         "--specpath",
@@ -130,11 +146,19 @@ def main() -> int:
     environment = os.environ.copy()
     environment["PYINSTALLER_CONFIG_DIR"] = str(build / "cache")
     subprocess.run(command, cwd=ROOT, check=True, env=environment)
-    executable = ROOT / "dist/ZJU-AC.exe"
-    archive = ROOT / "dist/ZJU-AC-win-x64.zip"
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
-        bundle.write(executable, executable.name)
-    print(f"\n构建完成：{executable}\n分发文件：{archive}")
+    subprocess.run(
+        [
+            str(compiler),
+            f"/DAppVersion={app_version}",
+            f"/DPayloadDir={build / 'payload/ZJU-AC'}",
+            f"/DOutputDir={ROOT / 'dist'}",
+            f"/DIconFile={icon}",
+            str(ROOT / "scripts/windows_installer.iss"),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+    print(f"\n安装包：{ROOT / 'dist' / f'ZJU-AC-Setup-{app_version}.exe'}")
     return 0
 
 

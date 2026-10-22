@@ -51,6 +51,24 @@ def test_allowlist_drops_unknown_events_and_untrusted_channel_values(recorder):
     assert entries[0]["http_status"] == 503
 
 
+def test_own_status_diagnostics_keep_only_allowlisted_states_and_sources(recorder):
+    diagnostics.record("own_status", source="radar", reason="matched", status="absent")
+    diagnostics.record(
+        "submit_cancelled",
+        source="private-account",
+        reason="private-code",
+        status="private-password",
+        activity="private-activity",
+    )
+    data = recorder.path.read_text("utf-8")
+    assert "private" not in data
+    entries = [json.loads(line) for line in data.splitlines()]
+    assert entries[0]["status"] == "absent"
+    assert entries[0]["source"] == "radar"
+    assert entries[1]["status"] == "unknown"
+    assert "source" not in entries[1]
+
+
 def test_bundle_exports_only_diagnostics_and_minimal_environment(recorder):
     diagnostics.record("code_read", activity="42", attempt=1)
     (recorder.directory / "config.toml").write_text("private-password", encoding="utf-8")

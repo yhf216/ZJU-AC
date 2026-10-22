@@ -14,6 +14,27 @@ from zju_ac.models import Rollcall
 from zju_ac.monitor import run_monitor
 
 
+def test_frozen_data_directory_is_next_to_executable_not_extraction_or_appdata(
+    tmp_path, monkeypatch
+):
+    from zju_ac.desktop import storage
+
+    monkeypatch.setattr(storage.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(storage.sys, "executable", str(tmp_path / "installed/ZJU-AC.exe"))
+    monkeypatch.setattr(storage.sys, "_MEIPASS", str(tmp_path / "extracted"), raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "old-appdata"))
+    assert storage.default_directory() == tmp_path / "installed/data"
+
+
+def test_source_data_directory_is_project_local(monkeypatch):
+    from pathlib import Path
+
+    from zju_ac.desktop import storage
+
+    monkeypatch.delattr(storage.sys, "frozen", raising=False)
+    assert storage.default_directory() == Path(storage.__file__).resolve().parents[2] / "data"
+
+
 def test_desktop_config_roundtrip_and_manual_selection(tmp_path):
     store = ConfigStore(tmp_path, CONFIG_PATH)
     store.save({"auto": False, "location": "YQ4", "attempts": 3, "retryInterval": 60})

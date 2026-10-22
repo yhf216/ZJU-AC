@@ -2,7 +2,6 @@
 
 import copy
 import json
-import os
 import sys
 import tomllib
 from pathlib import Path
@@ -36,9 +35,9 @@ FIELDS = {
 
 
 def default_directory() -> Path:
-    if os.name == "nt":
-        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "ZJU-AC"
-    return Path.home() / ".local/share/ZJU-AC"
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "data"
+    return Path(__file__).resolve().parents[2] / "data"
 
 
 def template_path() -> Path:

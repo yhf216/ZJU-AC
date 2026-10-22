@@ -343,6 +343,13 @@ class ConfirmedCheckin:
             self._result(fresh, "success")
             return
         if status != "absent":
+            diagnostic(
+                "submit_cancelled",
+                activity=fresh.id,
+                channel="number",
+                reason="own_state_not_absent",
+                status=status,
+            )
             print("本人状态不是明确的待签到状态，已取消提交。", flush=True)
             self._result(fresh, "failure")
             return
@@ -393,6 +400,13 @@ class ConfirmedCheckin:
             self._result(fresh, "success")
             return
         if status != "absent":
+            diagnostic(
+                "submit_cancelled",
+                activity=fresh.id,
+                channel="gps",
+                reason="own_state_not_absent",
+                status=status,
+            )
             print("本人状态不是明确的待签到状态，已取消后续定位请求。", flush=True)
             self._result(fresh, "failure")
             return
