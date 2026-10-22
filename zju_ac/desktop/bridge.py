@@ -538,7 +538,7 @@ class DesktopBridge(QObject):
 
     @Slot()
     def closeWindow(self):
-        if self.tray_available and self.state["running"]:
+        if self.tray_available:
             self.hideRequested.emit()
         else:
             self.requestQuit()

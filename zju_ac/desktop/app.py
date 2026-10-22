@@ -102,8 +102,7 @@ def main() -> int:
         ("打开窗口", show_window),
         ("暂停监控", bridge.pauseMonitor),
         ("继续监控", bridge.resumeMonitor),
-        ("退出登录", bridge.stopMonitor),
-        ("退出", bridge.requestQuit),
+        ("停止监控", bridge.requestQuit),
     ):
         action = QAction(label, menu)
         action.triggered.connect(callback)

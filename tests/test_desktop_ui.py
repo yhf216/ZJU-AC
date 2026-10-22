@@ -129,6 +129,44 @@ def test_stop_signals_worker_without_waiting_on_network(bridge):
     bridge.process = None
 
 
+@pytest.mark.parametrize("mode", ["idle", "paused", "recovering"])
+def test_close_window_keeps_app_in_tray_and_retains_session(bridge, mode):
+    bridge.tray_available = True
+    bridge._credentials = b"encrypted-session"
+    bridge._paused = mode == "paused"
+    bridge._restart_at = 100 if mode == "recovering" else 0
+    hidden, quit_ready = Mock(), Mock()
+    bridge.hideRequested.connect(hidden)
+    bridge.quitReady.connect(quit_ready)
+    bridge.closeWindow()
+    hidden.assert_called_once()
+    quit_ready.assert_not_called()
+    assert bridge._credentials == b"encrypted-session"
+    assert bridge._paused is (mode == "paused")
+    assert bridge._restart_at == (100 if mode == "recovering" else 0)
+    assert not bridge._quitting
+
+
+def test_tray_stop_waits_for_worker_shutdown_then_quits_without_restart(bridge):
+    process, connection, stop = Mock(), Mock(), Mock()
+    process.is_alive.return_value = True
+    connection.poll.return_value = False
+    bridge.process, bridge.connection, bridge.stop_event = process, connection, stop
+    bridge._credentials = b"encrypted-session"
+    quit_ready = Mock()
+    bridge.quitReady.connect(quit_ready)
+    bridge.requestQuit()
+    stop.set.assert_called_once()
+    quit_ready.assert_not_called()
+    assert bridge._quitting
+    process.is_alive.return_value = False
+    process.exitcode = 0
+    bridge.tick()
+    quit_ready.assert_called_once()
+    assert bridge.process is None
+    assert bridge._restart_at == 0
+
+
 def test_result_notifications_keep_pending_separate_and_deduplicate_count(bridge):
     notices = []
     bridge.notification.connect(lambda *values: notices.append(values))
